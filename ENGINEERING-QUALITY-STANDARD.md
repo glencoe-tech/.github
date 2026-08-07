@@ -74,7 +74,23 @@ plus secret scanning.
 - Zone security posture (TLS floor, always-use-HTTPS, DNSSEC) is owned by the zone's Terraform
   repo — dashboard toggling is a rule-11 violation even for "quick fixes".
 
-## 4. Adoption path for existing repos
+## 4. Enforcement — governance-as-code across the whole group
+
+This standard is not advisory: it is enforced mechanically by
+[`glencoe-tech/governance`](https://github.com/glencoe-tech/governance) — the group's
+governance-as-code root (the `glencoe-governance` GitHub App + OpenTofu), which applies org
+rulesets, Actions hardening, security defaults, and repo settings across **every owned org**:
+`glencoe-tech`, `serenoty-labs`, `AvenraCloud`, `screenmind`, `zerolatencylabs`
+(and `peeps-africa` once the App is installed there — currently a recorded gap).
+
+- Sister-company and client repos inherit the contract the same way engineering repos do —
+  landing in a governed org **is** opting into this standard.
+- A governance change that would let a repo drop below its tier is a change to this document
+  first; governance config never silently weakens the contract.
+- The AvenraCloud org additionally carries its own stricter EQS; governance enforces the union,
+  never the weaker of the two.
+
+## 5. Adoption path for existing repos
 
 1. Declare the tier in the README.
 2. Add the minimum gates for the tier (PR build + secret scan is one workflow file).
