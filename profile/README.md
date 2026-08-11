@@ -8,8 +8,6 @@ We believe the best technology proves its value over time. It solves real proble
 
 We build with that standard in mind.
 
-**Glencoe Technology is an ODG Group company.**
-
 [glencoetech.com](https://glencoetech.com)
 
 ---
