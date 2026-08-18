@@ -48,6 +48,10 @@ how code ships, how infrastructure exists, and what CI must prove — for every 
     first plan shows no changes — never mirrored by hand. Live coverage is proven by read-only
     account recon (`cloudflare-recon` in `AvenraCloud/avenra-infra` covers the shared account),
     because the account — not any repo — is the source of truth for what exists.
+12. **CI runs on the shared runner appliance.** Every new job in a private repo declares
+    `runs-on: [self-hosted, avenra-ci]`. GitHub-hosted runners are the exception, not the
+    default, and each exception is one of the narrow cases in §2 — not a preference. See §2,
+    *Where those gates run*.
 
 ## 2. Repo tiers — the same contract, gates sized to the surface
 
@@ -62,6 +66,57 @@ set scales:
 
 A repo with **no CI at all is out of contract** — the minimum for any tier is a PR build check
 plus secret scanning.
+
+### Where those gates run
+
+Gates run on the shared `avenra-ci` runner appliance, not on GitHub-hosted runners:
+
+```yaml
+jobs:
+  build:
+    runs-on: [self-hosted, avenra-ci]
+```
+
+Two things make this a hard default rather than a cost preference:
+
+- **`ubuntu-latest` does not merely cost money in this org — it does not run.** glencoe-tech's
+  included Actions minutes are exhausted and the org's Actions budget is pinned at `$0` with
+  `prevent_further_usage`. A job on a GitHub-hosted runner fails in seconds with a spending-limit
+  error, having executed zero steps. A workflow authored the old way is a broken workflow.
+- The appliance absorbs the estate's real compute at flat cost. It is defined in
+  `AvenraCloud/avenra-infra` at `infra/ci-runner/` and documented in that repo's
+  [`docs/SELF-HOSTED-RUNNERS.md`](https://github.com/AvenraCloud/avenra-infra/blob/main/docs/SELF-HOSTED-RUNNERS.md)
+  — the authority for capacity, security model and operations. It is shared by `glencoe-tech`,
+  `serenoty-labs` and `AvenraCloud`, with a small number of concurrent slots per org, so keep
+  jobs short and `timeout-minutes` honest.
+
+Each repo also needs `.github/actionlint.yaml` declaring the label, or the actionlint gate fails
+with `label "avenra-ci" is unknown`:
+
+```yaml
+self-hosted-runner:
+  labels:
+    - avenra-ci
+```
+
+**Standing exceptions — these legitimately stay on GitHub-hosted runners:**
+
+- **Public repos** (`glencoe-tech/.github`, `glencoe-tech/talos`). Their minutes are free, and
+  running fork-PR code on a shared box is a real security problem — the appliance's runner group
+  does not serve public repos at all.
+- **Fork-PR safety arms** in reusable workflows that deliberately force `ubuntu-latest` for
+  `pull_request` events from forks.
+- **Jobs needing a hosted-only runner feature**, notably `step-security/harden-runner`, which
+  only functions on GitHub-hosted runners.
+
+> **Temporary overlay (through 2026-09-01).** Credential-bearing and production-critical lanes —
+> Terraform plan/apply, production migrations, production promote/deploy, daily backups, GitHub
+> App token jobs — normally stay on GitHub-hosted runners, because the appliance must never see a
+> platform credential. While the budget cap is in force they are ported onto `avenra-ci` as an
+> explicit, time-boxed, risk-accepted exception; each ported line carries a `TEMP-HOSTED-PORT`
+> marker and reverts when the billing cycle resets. Checklist:
+> [`glencoe-tech/governance#10`](https://github.com/glencoe-tech/governance/issues/10). Do not
+> copy a `TEMP-HOSTED-PORT` line as a pattern for new credential-bearing work.
 
 ## 3. Cloudflare specifics (the shared account)
 
