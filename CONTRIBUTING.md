@@ -24,8 +24,25 @@ around it.
   credential is rotated first and cleaned up second.
 - **No legacy left behind.** Migrations reproduce properly, cut over, then delete — never rename
   or band-aid.
+- **No `ubuntu-latest` in a private repo.** New jobs declare `runs-on: [self-hosted, avenra-ci]`.
+  The org's Actions budget is pinned at `$0`, so a GitHub-hosted job does not just cost money —
+  it dies in seconds with zero steps executed. Standard §2, *Where those gates run*, lists the
+  handful of real exceptions (public repos, fork-PR arms, `harden-runner`).
 
 ## Getting a repo into contract
 
 Add the tier declaration + minimum workflow (PR build + secret scan) from the standard's §2/§4.
 When in doubt about a gate, copy the closest in-contract repo of the same tier.
+
+New or copied workflows also need `.github/actionlint.yaml` declaring the runner label, or
+actionlint fails the PR with `label "avenra-ci" is unknown`:
+
+```yaml
+self-hosted-runner:
+  labels:
+    - avenra-ci
+```
+
+This repo is one of the org's two public repos, so **its own** workflows stay on GitHub-hosted
+runners (free minutes; the appliance deliberately does not serve public repos). That is an
+exception to document, not a pattern to copy into a private repo.
