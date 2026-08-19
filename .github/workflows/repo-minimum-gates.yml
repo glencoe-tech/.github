@@ -52,12 +52,20 @@ jobs:
           GITLEAKS_SHA256: "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c"
         run: |
           set -euo pipefail
+          # Tools install into the per-job $RUNNER_TEMP, never the shared /usr/local or /tmp:
+          # eighteen runner slots share one box, so two jobs installing the same binary race
+          # (GNU install truncates the destination then chmods it — a reader that execs in that
+          # window gets EACCES), and a fixed /tmp path collides outright.
+          mkdir -p "${RUNNER_TEMP}/bin"
+          # GITHUB_PATH only affects LATER steps, so export for this one too.
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          export PATH="${RUNNER_TEMP}/bin:${PATH}"
           curl -fsSL --retry 3 \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             -o gitleaks.tgz
           echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum --check --strict -
           tar -xzf gitleaks.tgz gitleaks
-          sudo install -m0755 gitleaks /usr/local/bin/gitleaks
+          install -m0755 gitleaks "${RUNNER_TEMP}/bin/gitleaks"
           gitleaks version
       - name: scan
         run: gitleaks detect --source . --redact --no-banner
