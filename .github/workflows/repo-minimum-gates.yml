@@ -57,7 +57,9 @@ jobs:
           # (GNU install truncates the destination then chmods it — a reader that execs in that
           # window gets EACCES), and a fixed /tmp path collides outright.
           mkdir -p "${RUNNER_TEMP}/bin"
+          # GITHUB_PATH only affects LATER steps, so export for this one too.
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          export PATH="${RUNNER_TEMP}/bin:${PATH}"
           curl -fsSL --retry 3 \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             -o gitleaks.tgz
