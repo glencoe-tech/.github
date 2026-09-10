@@ -18,18 +18,27 @@ on:
     inputs:
       runs-on:
         description: >-
-          Runner target for BOTH gate jobs — a single label ("ubuntu-latest") or a JSON array of
-          labels ('["self-hosted", "avenra-ci"]').
+          Runner target for BOTH gate jobs, as a BARE LABEL. This input is a CLOSED LITERAL MAP
+          with exactly two outcomes: the exact value 'avenra-ci-k8s' selects the estate ARC
+          general lane, and EVERY other value resolves to 'ubuntu-latest'. Nothing is parsed as
+          JSON and no label list is assembled, so a JSON array, another self-hosted label, or a
+          hosted image other than ubuntu-latest is not rejected — it is silently mapped to
+          ubuntu-latest.
 
           Defaults to GitHub-hosted ubuntu-latest. Leave it at the default for PUBLIC callers
           (hosted minutes are free) and for any caller that accepts FORK pull requests — untrusted
-          contributor code must never be scheduled onto the shared self-hosted appliance.
+          contributor code must never be scheduled onto the shared self-hosted lanes.
 
-          A PRIVATE caller whose org has exhausted its hosted Actions allowance should pass
-          '["self-hosted", "avenra-ci"]' to run the floor on the estate CI appliance
-          (AvenraCloud/avenra-infra infra/ci-runner, docs/SELF-HOSTED-RUNNERS.md). Both jobs below
-          hold nothing beyond the default read-only GITHUB_TOKEN, which makes them box-eligible
-          under the estate runner rule.
+          A PRIVATE caller whose org has exhausted its hosted Actions allowance passes exactly
+          'avenra-ci-k8s' to run the floor on the estate ARC general lane. Do NOT pass
+          '["self-hosted", "avenra-ci"]': `avenra-ci` was retired on 2026-08-29 when the burst
+          pool was destroyed, ARC runners carry no `self-hosted` label at all, and under the map
+          above that string resolves to ubuntu-latest instead of failing — so the caller with no
+          hosted allowance left silently loses the very gate it was trying to keep. Which labels
+          exist is settled by the lane registry, AvenraCloud/.github conformance/runner-lanes.yml
+          (`avenra-ci-k8s` is lanes.general.implementation.runs_on; `avenra-ci` is under
+          `retired:`, successor `general`). Both jobs below hold nothing beyond the default
+          read-only GITHUB_TOKEN, which makes them box-eligible under the estate runner rule.
         type: string
         required: false
         default: ubuntu-latest
@@ -40,7 +49,8 @@ permissions:
 jobs:
   secret-scan:
     name: secret scan (gitleaks, full history)
-    # A JSON array is decoded into a label list; a bare label is passed through as a string.
+    # Closed literal map, not a decoder: only the exact scalar 'avenra-ci-k8s' selects the ARC
+    # general lane; every other value — a JSON array included — resolves to ubuntu-latest.
     runs-on: ${{ inputs.runs-on == 'avenra-ci-k8s' && 'avenra-ci-k8s' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,7 +82,8 @@ jobs:
 
   build:
     name: build (must succeed on PR)
-    # A JSON array is decoded into a label list; a bare label is passed through as a string.
+    # Closed literal map, not a decoder: only the exact scalar 'avenra-ci-k8s' selects the ARC
+    # general lane; every other value — a JSON array included — resolves to ubuntu-latest.
     runs-on: ${{ inputs.runs-on == 'avenra-ci-k8s' && 'avenra-ci-k8s' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
