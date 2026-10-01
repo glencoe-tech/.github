@@ -1,0 +1,44 @@
+name: "Task"
+description: "A bounded piece of work with its own acceptance criteria, usually one pull request."
+type: "Task"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "The smallest independently executable unit, typically one pull request. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: objective
+    attributes:
+      label: "Objective"
+      description: "One or two sentences: what this work achieves."
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: "Scope"
+      description: "What is included. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: "Acceptance criteria"
+      description: "Numbered, observable, testable criteria. A reviewer checks each one. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: validation
+    attributes:
+      label: "Validation"
+      description: "How the result is verified: commands, tests, environments. Required from Stage Ready."
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Acceptance criteria met.\n- [ ] Validation complete.\n- [ ] Linked pull request merged.\n- [ ] Evidence recorded."
+    validations:
+      required: false

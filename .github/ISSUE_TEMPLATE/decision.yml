@@ -1,0 +1,79 @@
+name: "Decision"
+description: "Product or architecture decision that must produce an explicit accepted outcome."
+type: "Decision"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "A question with options that needs an accepted outcome from a named decider. It blocks the work it gates through native dependencies. Architecture decisions also land as an ADR in the owning repository; the issue is the work item, the ADR is the durable record. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: decision-question
+    attributes:
+      label: "Decision question"
+      description: "The single question that needs an accepted answer."
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: "Context"
+      description: "Why this must be decided now, and the constraints that bind the answer."
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: "Constraints"
+      description: "Accepted decisions, requirements, budgets or deadlines the answer must respect."
+    validations:
+      required: false
+  - type: textarea
+    id: options
+    attributes:
+      label: "Options"
+      description: "Each option with its consequences. Recommend one. Required from Stage In Review."
+    validations:
+      required: false
+  - type: textarea
+    id: evidence
+    attributes:
+      label: "Evidence"
+      description: "Facts, measurements and Research that bear on the options, with links."
+    validations:
+      required: false
+  - type: input
+    id: decider
+    attributes:
+      label: "Decider"
+      description: "Who has the authority to decide (a GitHub login or a role)."
+    validations:
+      required: false
+  - type: textarea
+    id: decision
+    attributes:
+      label: "Decision"
+      description: "Filled by the decider: the chosen option, rationale and revisit trigger. Required from Stage Decided."
+    validations:
+      required: false
+  - type: textarea
+    id: consequences
+    attributes:
+      label: "Consequences"
+      description: "What changes because of the decision, and which work it unblocks. Required from Stage Decided."
+    validations:
+      required: false
+  - type: textarea
+    id: downstream-work
+    attributes:
+      label: "Downstream work"
+      description: "The issues this decision unblocks or creates, as links."
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Question answered by the named decider.\n- [ ] Evidence sufficient for the decision's consequence.\n- [ ] Decision, rationale and consequences recorded.\n- [ ] Downstream work linked; the ADR exists where the decision is architectural."
+    validations:
+      required: false

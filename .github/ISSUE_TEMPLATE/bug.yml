@@ -1,0 +1,65 @@
+name: "Bug"
+description: "Shipped or merged behaviour that is wrong. Attached to a feature by Map ID, never by becoming it."
+type: "Bug"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "A defect in behaviour that has been merged or shipped. It is attached to the affected feature through its Map ID; its Work Class is the class of what it breaks, or Security when it is exploitable. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: observed
+    attributes:
+      label: "Observed"
+      description: "What happens, with the exact error or output."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Expected"
+      description: "What should happen, and where that behaviour is specified."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "Reproduction"
+      description: "Exact steps, environment and revision. A failing test is the best reproduction."
+    validations:
+      required: false
+  - type: textarea
+    id: impact
+    attributes:
+      label: "Impact"
+      description: "Who is affected, how badly, how often. Exploitable? Then Work Class is Security."
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: "Acceptance criteria"
+      description: "Numbered, observable, testable criteria. A reviewer checks each one. Required from Stage Ready."
+    validations:
+      required: false
+  - type: textarea
+    id: regression-proof
+    attributes:
+      label: "Regression proof"
+      description: "The test that fails before the fix and passes after it."
+    validations:
+      required: false
+  - type: textarea
+    id: verification
+    attributes:
+      label: "Verification"
+      description: "Where and how the fix was verified where the bug was observed."
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Fix merged with a regression test that fails before the fix.\n- [ ] Fix verified where it was observed.\n- [ ] No known regression."
+    validations:
+      required: false

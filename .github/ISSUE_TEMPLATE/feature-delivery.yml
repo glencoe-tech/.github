@@ -1,0 +1,90 @@
+name: "Feature Delivery"
+description: "Work that delivers or changes one Product Map feature or capability. The feature itself lives in the Product Map."
+type: "Feature Delivery"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "The work item that creates, changes or extends one Product Map feature (or one capability where features are not yet declared). Replaces GitHub's default Feature type, whose name invites confusing the work item with the product feature. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: objective
+    attributes:
+      label: "Objective"
+      description: "One or two sentences: what this work achieves."
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: "Outcome"
+      description: "What will be true for users or the business when this is done? Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: scope
+    attributes:
+      label: "Scope"
+      description: "What is included. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: "Non-goals"
+      description: "What is deliberately excluded. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: "Acceptance criteria"
+      description: "Numbered, observable, testable criteria. A reviewer checks each one. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: "Dependencies"
+      description: "Decisions, platforms or other deliveries this needs, as links. Make each one a blocked-by dependency."
+    validations:
+      required: false
+  - type: textarea
+    id: security-considerations
+    attributes:
+      label: "Security considerations"
+      description: "Data touched, trust boundaries crossed, new credentials or permissions. 'None' is an answer; leaving it empty is not."
+    validations:
+      required: false
+  - type: textarea
+    id: observability-considerations
+    attributes:
+      label: "Observability considerations"
+      description: "How we will know it works in production: metrics, logs, traces, alerts."
+    validations:
+      required: false
+  - type: dropdown
+    id: qualification-requirement
+    attributes:
+      label: "Qualification requirement"
+      description: "Whether a Qualification must be Verified before this is Admitted or Released."
+      options:
+        - "Required: the Product Map marks this feature qualification required"
+        - "Not required"
+        - "Unknown: ask the product owner"
+    validations:
+      required: false
+  - type: textarea
+    id: evidence
+    attributes:
+      label: "Evidence"
+      description: "What evidence must exist before this is done (tests, run links, qualification results). Required from Stage Ready."
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Requirements accepted.\n- [ ] Implementation complete and merged.\n- [ ] Tests pass.\n- [ ] Security considered.\n- [ ] Observability present.\n- [ ] Independent review complete.\n- [ ] Qualification complete where the Product Map requires it.\n- [ ] Evidence attached.\n- [ ] Release state explicit (Admitted or Released)."
+    validations:
+      required: false
