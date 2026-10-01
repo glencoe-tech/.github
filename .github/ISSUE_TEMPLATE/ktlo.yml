@@ -1,0 +1,54 @@
+name: "KTLO"
+description: "Keep-the-lights-on: upkeep of an existing product or service that adds no capability."
+type: "KTLO"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "Upkeep that keeps an existing product or service operating safely, with a KTLO Category. Never a dumping ground: a vulnerability is Security, a defect is a Bug, new capability is Product or Platform work. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: operational-need
+    attributes:
+      label: "Operational need"
+      description: "What must be kept running, and what happens if this is deferred."
+    validations:
+      required: true
+  - type: textarea
+    id: if-deferred
+    attributes:
+      label: "If deferred"
+      description: "The risk of inaction: what happens, and when, if this is not done."
+    validations:
+      required: false
+  - type: textarea
+    id: required-action
+    attributes:
+      label: "Required action"
+      description: "The concrete action. Required from Stage Ready."
+    validations:
+      required: false
+  - type: textarea
+    id: validation
+    attributes:
+      label: "Validation"
+      description: "How the result is verified: commands, tests, environments. Required from Stage Ready."
+    validations:
+      required: false
+  - type: dropdown
+    id: recurrence
+    attributes:
+      label: "Recurrence"
+      description: "Whether this comes back."
+      options:
+        - "One-off"
+        - "Recurring: schedule the next occurrence when closing"
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Operational objective achieved.\n- [ ] Validation complete.\n- [ ] No known regression.\n- [ ] Recurring work rescheduled where it recurs."
+    validations:
+      required: false

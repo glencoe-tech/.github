@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Product and Work Standard"
+    url: "https://github.com/glencoe-tech/governance/blob/main/docs/work-system/QUICKSTART.md"
+    about: "Which issue type to use, and what each one needs."

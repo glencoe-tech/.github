@@ -1,0 +1,79 @@
+name: "Qualification"
+description: "Proves a requirement with evidence and records a verdict. Passing tests is not qualification."
+type: "Qualification"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "Proves that a feature, capability or release meets a stated requirement, in a named environment, by a stated procedure, and records the verdict and its limitations. Release and production admission gates are Qualifications whose verdict is an admission record. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: requirement
+    attributes:
+      label: "Requirement"
+      description: "The requirement or acceptance criterion this proves, with its source."
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: "Revision"
+      description: "The exact revision (commit SHA, image digest or release) under qualification."
+    validations:
+      required: false
+  - type: textarea
+    id: procedure
+    attributes:
+      label: "Procedure"
+      description: "Exact steps, so another person or agent can repeat them. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: "Environment"
+      description: "Where it runs: environment, revision, data. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Expected"
+      description: "What a passing run looks like, stated before the run."
+    validations:
+      required: false
+  - type: textarea
+    id: actual
+    attributes:
+      label: "Actual"
+      description: "What the run showed. Filled after execution."
+    validations:
+      required: false
+  - type: textarea
+    id: evidence
+    attributes:
+      label: "Evidence"
+      description: "What evidence must exist before this is done (tests, run links, qualification results). Required from Stage In Review."
+    validations:
+      required: false
+  - type: textarea
+    id: limitations
+    attributes:
+      label: "Limitations"
+      description: "What this qualification does not prove."
+    validations:
+      required: false
+  - type: textarea
+    id: verdict
+    attributes:
+      label: "Verdict"
+      description: "PASS or FAIL, the exact revision, and the limitations of the result. Required from Stage Verified."
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Procedure executed in the named environment.\n- [ ] Actual result and evidence attached and bound to an exact revision.\n- [ ] Verdict recorded with limitations.\n- [ ] Admission recorded by the human acceptance authority where this is an admission gate."
+    validations:
+      required: false

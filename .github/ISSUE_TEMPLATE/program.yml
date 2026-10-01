@@ -1,0 +1,44 @@
+name: "Program"
+description: "Major product or engineering outcome spanning multiple epics and repositories."
+type: "Program"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "A strategic outcome that spans several epics and usually several repositories. The brief's INITIATIVE; the AvenraCloud type of this name already exists and is kept. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: outcome
+    attributes:
+      label: "Outcome"
+      description: "What will be true for users or the business when this is done?"
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: "Scope"
+      description: "What is included. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: "Non-goals"
+      description: "What is deliberately excluded. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: success-criteria
+    attributes:
+      label: "Success criteria"
+      description: "Observable conditions that prove the outcome. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Every child epic is closed as completed or deliberately not planned.\n- [ ] Success criteria are met, each with evidence.\n- [ ] Release or admission records exist where the outcome required them."
+    validations:
+      required: false

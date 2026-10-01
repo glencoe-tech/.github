@@ -1,0 +1,58 @@
+name: "Research"
+description: "Time-bounded investigation intended to resolve uncertainty with evidence."
+type: "Research"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "A time-bounded investigation that turns uncertainty into decision-relevant findings. It usually blocks the Decision it informs. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: question
+    attributes:
+      label: "Question"
+      description: "What we need to find out, and why."
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: "Scope"
+      description: "What is included. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: what-would-answer-it
+    attributes:
+      label: "What would answer it"
+      description: "The evidence that would settle the question, and the time box."
+    validations:
+      required: false
+  - type: textarea
+    id: findings
+    attributes:
+      label: "Findings"
+      description: "What was found, with sources. Required from Stage In Review."
+    validations:
+      required: false
+  - type: textarea
+    id: recommendation
+    attributes:
+      label: "Recommendation"
+      description: "What the findings recommend, and which decision they inform. Required from Stage In Review."
+    validations:
+      required: false
+  - type: input
+    id: decision-informed
+    attributes:
+      label: "Decision informed"
+      description: "The Decision issue this research informs (link)."
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Question answered or declared unanswerable with reasons.\n- [ ] Findings and unknowns recorded.\n- [ ] The decision it informs is linked."
+    validations:
+      required: false

@@ -1,0 +1,44 @@
+name: "Epic"
+description: "Substantial multi-issue outcome within a program."
+type: "Epic"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "A substantial outcome delivered through several Feature Deliveries or Tasks, usually aligned to one Product Map capability or domain. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: outcome
+    attributes:
+      label: "Outcome"
+      description: "What will be true for users or the business when this is done?"
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: "Scope"
+      description: "What is included. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: "Acceptance criteria"
+      description: "Numbered, observable, testable criteria. A reviewer checks each one. Required from Stage Defined."
+    validations:
+      required: false
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: "Dependencies"
+      description: "Other work, decisions or platforms this needs, as links (blocked-by for work in this organization; full URLs otherwise)."
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Children closed.\n- [ ] Acceptance criteria met with evidence.\n- [ ] Qualification verified where the Product Map says qualification is required."
+    validations:
+      required: false

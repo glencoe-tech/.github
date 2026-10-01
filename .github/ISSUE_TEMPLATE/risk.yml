@@ -1,0 +1,58 @@
+name: "Risk"
+description: "An identified risk with an owner, impact, mitigation and review date."
+type: "Risk"
+projects: ["glencoe-tech/4"]
+body:
+  - type: markdown
+    attributes:
+      value: "A risk to a product, programme or the company, with its owner, impact, mitigation and review date. Risk acceptance belongs to the human acceptance authority. A register issue holds several related risks. Set Work Class, Stage, Product and Map ID in the sidebar; Map ID is the most specific Product Map id this work concerns. Only the first fields are required now; the others become required as the Stage advances. Generated from work/taxonomy.json in glencoe-tech/governance (governance 1.3.0); do not edit by hand."
+  - type: textarea
+    id: risk
+    attributes:
+      label: "Risk"
+      description: "What may go wrong."
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: "Impact"
+      description: "What happens if it does, and to whom."
+    validations:
+      required: true
+  - type: input
+    id: owner
+    attributes:
+      label: "Owner"
+      description: "Who watches this risk (a GitHub login). Assign them too."
+    validations:
+      required: false
+  - type: textarea
+    id: mitigation
+    attributes:
+      label: "Mitigation"
+      description: "What reduces the risk, or who accepts it until when. Required from Stage In Progress."
+    validations:
+      required: false
+  - type: input
+    id: review-date
+    attributes:
+      label: "Review date"
+      description: "When this risk is next reviewed (YYYY-MM-DD)."
+    validations:
+      required: false
+  - type: input
+    id: acceptance-authority
+    attributes:
+      label: "Acceptance authority"
+      description: "Who may accept this risk if it is not mitigated. Risk acceptance is never an agent's."
+    validations:
+      required: false
+  - type: textarea
+    id: done-when
+    attributes:
+      label: "Done when"
+      description: "The definition of done, as a checklist; the work is done when every item holds."
+      value: "- [ ] Mitigated with evidence, or accepted by the human acceptance authority with a revisit date."
+    validations:
+      required: false
