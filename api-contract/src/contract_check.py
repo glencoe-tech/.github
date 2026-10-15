@@ -613,7 +613,8 @@ def check_compatibility(policy: Policy, outcome: Outcome, workdir: Path, first_r
     for fid in sorted(set(exceptions) - used):
         annotate("notice", "api-contract exception", f"exception '{fid}' matched no finding; remove it when it is no longer needed")
     declared_step = step_between(released, declared)
-    outcome.outputs.update({"required-step": required, "declared-step": declared_step})
+    outcome.outputs.update({"required-step": required, "declared-step": declared_step,
+                            "findings": json.dumps(sorted({fid for fid, _, _ in counted}))})
     risky = [fid for fid, _, e in counted if e.get("level") == 2]
     breaking = [fid for fid, step, _ in counted if step == "major"]
     if risky:

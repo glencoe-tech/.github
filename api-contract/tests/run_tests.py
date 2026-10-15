@@ -189,6 +189,7 @@ class Case:
     reason: str
     outputs: dict[str, str] = field(default_factory=dict)
     first_release: str = "false"
+    finding: str = ""  # a finding id that must be among the counted findings (output `findings`)
 
 
 def base_files(policy: str = POLICY, version: str = "1.0.0", text: str | None = None) -> dict[str, str | None]:
@@ -316,7 +317,7 @@ CASES: list[Case] = [
     Case("compat/additive+patch", "compatibility", pr(base_files(), {"openapi.yaml": additive("1.0.1")}),
          "fail", "version-step-insufficient", {"required-step": "minor", "declared-step": "patch"}),
     Case("compat/endpoint-removed+minor", "compatibility", pr(base_files(), {"openapi.yaml": removed("1.1.0")}),
-         "fail", "version-step-insufficient", {"required-step": "major"}),
+         "fail", "version-step-insufficient", {"required-step": "major"}, finding=REMOVAL_ID),
     Case("compat/endpoint-removed+major (positive control)", "compatibility",
          pr(base_files(), {"openapi.yaml": removed("2.0.0")}), "pass", "ok", {"required-step": "major"}),
     Case("compat/auth-added-to-public-route+minor (severity override)", "compatibility",
@@ -360,7 +361,7 @@ CASES: list[Case] = [
          pr(base_files(version="0.9.0"), {"openapi.yaml": additive("1.1.0")}), "fail", "tag-version-mismatch"),
     Case("compat/head-loosens-exceptions (base policy used)", "compatibility",
          pr(base_files(), {"openapi.yaml": removed("1.1.0"), ".github/api-contract.yml": with_exception(REMOVAL_ID, FUTURE)}),
-         "fail", "version-step-insufficient", {"required-step": "major"}),
+         "fail", "version-step-insufficient", {"required-step": "major"}, finding=REMOVAL_ID),
     Case("compat/exception-granted-at-base (positive control)", "compatibility",
          pr(base_files(with_exception(REMOVAL_ID, FUTURE)), {"openapi.yaml": removed("1.1.0")}),
          "pass", "ok", {"required-step": "patch"}),
@@ -376,7 +377,7 @@ CASES: list[Case] = [
          "fail", "exception-invalid"),
     Case("compat/oasdiff-config-injected-by-head", "compatibility",
          pr(base_files(), {"openapi.yaml": removed("1.1.0"), ".oasdiff.yaml": OASDIFF_INJECTION}),
-         "fail", "version-step-insufficient", {"required-step": "major"}),
+         "fail", "version-step-insufficient", {"required-step": "major"}, finding=REMOVAL_ID),
     Case("compat/policy-missing-at-base", "compatibility",
          pr({"openapi.yaml": doc()}, {".github/api-contract.yml": POLICY, "openapi.yaml": additive("1.1.0")}),
          "fail", "policy-missing-at-base"),
@@ -434,6 +435,8 @@ def run_case(case: Case, scratch: Path, toolchain: Path) -> tuple[bool, str]:
         problems.append(f"reasons {reasons}, expected {case.reason!r}")
     if case.result == "pass" and reasons != ["ok"]:
         problems.append(f"a pass must carry no failure reason, got {reasons}")
+    if case.finding and case.finding not in json.loads(outputs.get("findings") or "[]"):
+        problems.append(f"finding {case.finding!r} not reported; findings={outputs.get('findings')}")
     for key, value in case.outputs.items():
         if outputs.get(key) != value:
             problems.append(f"output {key}={outputs.get(key)!r}, expected {value!r}")
