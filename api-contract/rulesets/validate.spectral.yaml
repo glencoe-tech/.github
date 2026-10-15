@@ -1,0 +1,10 @@
+# The `validate` check's Spectral run: ONLY the OpenAPI schema itself (GACS-1 §5.A.1).
+#
+# Spectral validates an `openapi: 3.1.x` document against the OpenAPI 3.1 schema (format oas3_1).
+# Everything else in `spectral:oas` is switched off here; style and the GACS rules are the `lint`
+# check's job. The 3.1-only conditions a schema cannot see (a 3.1 header over 3.0 constructs, the
+# schema dialect, info.version) are checked by contract_check.py beside this run.
+extends:
+  - [spectral:oas, off]
+rules:
+  oas3-schema: error

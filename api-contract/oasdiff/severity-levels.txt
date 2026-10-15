@@ -1,0 +1,9 @@
+api-global-security-added err
+api-global-security-scope-added err
+api-operation-id-removed err
+api-security-added err
+api-security-component-removed err
+api-security-component-type-changed err
+api-security-scope-added err
+request-body-enum-value-removed err
+response-non-success-status-removed err

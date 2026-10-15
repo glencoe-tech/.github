@@ -1,0 +1,109 @@
+# Synthetic contract used only by the api-contract self-test. Not a real service.
+openapi: 3.1.0
+info:
+  title: Widgets (synthetic test fixture)
+  version: __VERSION__
+  description: A synthetic API used to exercise the api-contract checks.
+  contact:
+    name: Fixture
+    url: https://example.com
+servers:
+  - url: https://api.example.com
+tags:
+  - name: widgets
+    description: Widgets.
+security:
+  - bearer: []
+paths:
+  /widgets:
+    get:
+      operationId: listWidgets
+      summary: List widgets
+      description: Lists widgets.
+      tags: [widgets]
+      security:
+        - bearer: []
+      parameters:
+        - name: cursor
+          in: query
+          description: Opaque cursor.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: A page of widgets.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WidgetPage"
+        "400":
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /widgets/{widgetId}:
+    get:
+      operationId: getWidget
+      summary: Get a widget
+      description: Gets one widget.
+      tags: [widgets]
+      security:
+        - bearer: []
+      parameters:
+        - name: widgetId
+          in: path
+          required: true
+          description: Widget identifier.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The widget.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Widget"
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  schemas:
+    Widget:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          description: Opaque identifier.
+        name:
+          type: string
+          description: Display name.
+    WidgetPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Widget"
+        next_cursor:
+          type: [string, "null"]
+          description: Cursor of the next page, null on the last page.
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable message.

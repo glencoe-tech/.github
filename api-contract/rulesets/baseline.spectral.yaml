@@ -1,0 +1,63 @@
+# Baseline lint ruleset for the `lint` check (GACS-1 §5.A.6: "the standard requires that one exists
+# and that it enforces points 2 to 4").
+#
+# This file runs ALONE, exactly as shipped at the action SHA the caller pinned. A product's own
+# ruleset (policy `lint.ruleset`, read from the pull request's BASE revision) runs as a SECOND,
+# separate Spectral pass. Because the two never merge, a product ruleset can add rules or raise
+# severities, and cannot switch off or lower anything here.
+#
+# Fails on `error`. The recommended rules keep their own severities: warnings are reported, not
+# failed, matching §5.A.6 ("passes ... with no errors"). A product that wants warnings to fail
+# promotes them in its own ruleset.
+extends:
+  - spectral:oas
+
+rules:
+  # §5.A.2 - every operation has a unique, stable operationId.
+  operation-operationId: error
+  operation-operationId-unique: error
+
+  # §5.A.3 - every operation states its authentication. An explicit `security: []` declares a
+  # public operation; inheriting the document-level requirement is not stated on the operation,
+  # and silence is not a declaration.
+  gacs-operation-security-declared:
+    description: Every operation states its authentication (`security`, or `security: []` when public).
+    message: "{{path}} does not declare `security` (use `security: []` for a public operation)."
+    severity: error
+    given: "$.paths[*][get,put,post,delete,options,head,patch,trace]"
+    then:
+      field: security
+      function: defined
+
+  # §5.A.4 - every operation documents its success response ...
+  operation-success-response: error
+
+  # ... and the error responses a consumer has to handle.
+  gacs-operation-error-response:
+    description: Every operation documents at least one error response (4xx, 5xx or default).
+    message: "{{path}} documents no error response (4xx, 5xx or default)."
+    severity: error
+    given: "$.paths[*][get,put,post,delete,options,head,patch,trace].responses"
+    then:
+      function: schema
+      functionOptions:
+        schema:
+          type: object
+          # "Not every property name fails the pattern" = at least one name matches it.
+          not:
+            propertyNames:
+              not:
+                pattern: "^([45]([0-9]{2}|XX)|default)$"
+
+  # §5.A.5 - request and response bodies reference named schemas.
+  gacs-body-schema-named:
+    description: Request and response bodies reference a named schema ($ref), not an inline one.
+    message: "{{path}} is an inline schema; reference a named schema under components/schemas."
+    severity: error
+    resolved: false
+    given:
+      - "$.paths[*][get,put,post,delete,options,head,patch,trace].requestBody.content[*].schema"
+      - "$.paths[*][get,put,post,delete,options,head,patch,trace].responses[*].content[*].schema"
+    then:
+      field: $ref
+      function: truthy
