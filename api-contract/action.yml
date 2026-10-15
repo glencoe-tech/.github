@@ -91,4 +91,11 @@ runs:
         API_CONTRACT_FIRST_RELEASE: ${{ inputs.first-release }}
       run: |
         set -euo pipefail
-        "${PYTHON}" -I "${GITHUB_ACTION_PATH}/src/contract_check.py" --check "${CHECK}"
+        # setup-python runs with update-environment: false, so it exports nothing. On a self-hosted
+        # runner the toolcache interpreter is linked against libpython in its own lib/ directory and
+        # finds it only through LD_LIBRARY_PATH ("error while loading shared libraries:
+        # libpython3.12.so.1.0", 2026-10-15). Point the loader at that directory for this one
+        # command; no other variable changes.
+        PYTHON_LIB="$(dirname "$(dirname "${PYTHON}")")/lib"
+        LD_LIBRARY_PATH="${PYTHON_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+          "${PYTHON}" -I "${GITHUB_ACTION_PATH}/src/contract_check.py" --check "${CHECK}"
