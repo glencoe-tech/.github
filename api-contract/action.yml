@@ -1,0 +1,94 @@
+name: api-contract
+description: >-
+  GACS-1 API contract checks for an OpenAPI 3.1 contract, one check per step: validate, lint,
+  compatibility (against the last released contract, from release tags), sdk, lockfile.
+  Reference by full commit SHA: glencoe-tech/.github/api-contract@<sha>.
+
+# A composite action, not a reusable workflow, so that the code that runs is exactly the code at
+# the SHA the caller pinned: GitHub downloads this repository at that ref and every step below
+# reads its scripts from $GITHUB_ACTION_PATH inside that download. Nothing here refers to a branch
+# or tag of this repository. See README.md, "Why a composite action".
+
+inputs:
+  check:
+    description: "Which check to run: validate | lint | compatibility | sdk | lockfile."
+    required: true
+  first-release:
+    description: >-
+      "true" only on the reviewed pull request that makes the FIRST release of a contract. Honoured
+      only by `compatibility`, and only when no release tag exists locally or on origin; with any
+      release tag present it is itself a failure.
+    required: false
+    default: "false"
+  policy:
+    description: >-
+      Repository path of the policy file. It is read from the BASE revision (base-sha), never from
+      the revision under test.
+    required: false
+    default: .github/api-contract.yml
+  base-sha:
+    description: >-
+      The revision the policy is read from. Defaults to the pull request's base, the merge queue's
+      base, or (on push) the pushed commit.
+    required: false
+    default: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
+  working-directory:
+    description: Root of the full clone to check (actions/checkout with fetch-depth 0).
+    required: false
+    default: "."
+
+outputs:
+  result:
+    description: "pass or fail."
+    value: ${{ steps.check.outputs.result }}
+  reasons:
+    description: "Space-separated reason codes (README, Reason codes); `ok` on a pass."
+    value: ${{ steps.check.outputs.reasons }}
+  required-step:
+    description: "compatibility: the smallest version step the change needs (none|patch|minor|major)."
+    value: ${{ steps.check.outputs.required-step }}
+  declared-step:
+    description: "compatibility: the step info.version takes from the last release."
+    value: ${{ steps.check.outputs.declared-step }}
+  baseline:
+    description: "compatibility: the release tag compared against (`none` on a first release)."
+    value: ${{ steps.check.outputs.baseline }}
+  findings:
+    description: "compatibility: JSON list of the classified findings that set the required step."
+    value: ${{ steps.check.outputs.findings }}
+
+runs:
+  using: composite
+  steps:
+    - id: python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: "3.12"
+        update-environment: false
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: "22"
+        # No cache: the toolchain installs from its own lockfile, and a cache keyed on the
+        # caller's files is not something this action should restore.
+        package-manager-cache: false
+    - name: install pinned toolchain (oasdiff by SHA-256, Spectral by lockfile)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Per-job $RUNNER_TEMP, never a shared path: runner slots on one box would race.
+        "${GITHUB_ACTION_PATH}/bin/install-toolchain.sh" "${RUNNER_TEMP}/api-contract-toolchain"
+    - id: check
+      name: api-contract ${{ inputs.check }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      # Inputs reach the script only through the environment, never spliced into the command.
+      env:
+        CHECK: ${{ inputs.check }}
+        PYTHON: ${{ steps.python.outputs.python-path }}
+        API_CONTRACT_TOOLCHAIN: ${{ runner.temp }}/api-contract-toolchain
+        API_CONTRACT_BASE_SHA: ${{ inputs.base-sha }}
+        API_CONTRACT_POLICY: ${{ inputs.policy }}
+        API_CONTRACT_FIRST_RELEASE: ${{ inputs.first-release }}
+      run: |
+        set -euo pipefail
+        "${PYTHON}" -I "${GITHUB_ACTION_PATH}/src/contract_check.py" --check "${CHECK}"

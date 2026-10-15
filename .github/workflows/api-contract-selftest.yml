@@ -1,0 +1,111 @@
+name: api-contract self-test
+
+# Proves the api-contract action (api-contract/) against synthetic fixture histories built at test
+# time: every case asserts PASS or FAIL AND the reason code, and every failure case has a positive
+# control. Two jobs:
+#   harness - every case, through the same entry point the action runs (make -C api-contract test,
+#             the command used locally too);
+#   action  - a representative case per check through the composite action itself (uses:
+#             ./api-contract), proving its inputs, environment wiring and outputs.
+#
+# This repository is public, so its own jobs run on GitHub-hosted runners (EQS §2 standing
+# exception). Read-only token; no secrets.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-contract-selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness:
+    name: api-contract self-test (all cases)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: make test
+        run: make -C api-contract test
+
+  action:
+    name: api-contract self-test (action, ${{ matrix.case }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - "validate/valid-3.1 (positive control)"
+          - "validate/3.0-construct-under-3.1-header"
+          - "lint/baseline-clean (positive control)"
+          - "lint/operation-without-security"
+          - "compat/additive+minor (positive control)"
+          - "compat/endpoint-removed+minor"
+          - "compat/no-tags-with-bootstrap (positive control)"
+          - "compat/no-tags-no-bootstrap"
+          - "compat/head-loosens-exceptions (base policy used)"
+          - "sdk/hand-edited"
+          - "lockfile/stale"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: build the fixture history
+        id: fixture
+        env:
+          CASE: ${{ matrix.case }}
+        run: |
+          set -euo pipefail
+          python3 api-contract/tests/run_tests.py --build "${CASE}" --into "${RUNNER_TEMP}/fixture" > "${RUNNER_TEMP}/case.json"
+          python3 - "${RUNNER_TEMP}/case.json" >> "${GITHUB_OUTPUT}" <<'EOF'
+          import json, sys
+          case = json.load(open(sys.argv[1]))
+          for key in ("workdir", "base_sha", "check", "first_release", "result", "reason"):
+              print(f"{key}={case[key]}")
+          EOF
+      - name: run the action
+        id: contract
+        # The case may be one that must FAIL; the next step asserts the outcome and the reason.
+        continue-on-error: true
+        uses: ./api-contract
+        with:
+          check: ${{ steps.fixture.outputs.check }}
+          base-sha: ${{ steps.fixture.outputs.base_sha }}
+          first-release: ${{ steps.fixture.outputs.first_release }}
+          working-directory: ${{ steps.fixture.outputs.workdir }}
+      - name: assert result and reason
+        env:
+          OUTCOME: ${{ steps.contract.outcome }}
+          RESULT: ${{ steps.contract.outputs.result }}
+          REASONS: ${{ steps.contract.outputs.reasons }}
+          EXPECT_RESULT: ${{ steps.fixture.outputs.result }}
+          EXPECT_REASON: ${{ steps.fixture.outputs.reason }}
+        run: |
+          set -euo pipefail
+          echo "outcome=${OUTCOME} result=${RESULT} reasons=${REASONS}; expected ${EXPECT_RESULT} (${EXPECT_REASON})"
+          expected_outcome=success
+          [ "${EXPECT_RESULT}" = "pass" ] || expected_outcome=failure
+          [ "${OUTCOME}" = "${expected_outcome}" ] || { echo "::error::step outcome ${OUTCOME}, expected ${expected_outcome}"; exit 1; }
+          [ "${RESULT}" = "${EXPECT_RESULT}" ] || { echo "::error::result ${RESULT}, expected ${EXPECT_RESULT}"; exit 1; }
+          case " ${REASONS} " in
+            *" ${EXPECT_REASON} "*) ;;
+            *) echo "::error::reasons '${REASONS}' do not include ${EXPECT_REASON}"; exit 1 ;;
+          esac
