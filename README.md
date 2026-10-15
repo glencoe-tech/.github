@@ -13,6 +13,7 @@ shared workflows other repositories call. It holds no product code.
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | The working agreement around the standard: the PR flow, the hard rules, how to bring a repository into contract | Read before a first pull request |
 | [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) | The organization's issue forms, one per work type, and `config.yml` | Anyone opening an issue in a repository without its own forms |
 | [`.github/workflows/repo-minimum-gates.yml`](.github/workflows/repo-minimum-gates.yml) | The reusable EQS floor: a full-history secret scan and a build that must succeed | Repositories that call it, pinned by SHA |
+| [`api-contract/`](api-contract/README.md) | The API contract check (GACS-1): validates, lints and compares an OpenAPI 3.1 contract with its last release, and proves a generated SDK reproduces | Repositories that use it, pinned by SHA |
 
 ## Issue forms
 
