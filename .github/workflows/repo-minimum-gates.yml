@@ -6,33 +6,21 @@ name: repo-minimum-gates
 #
 # Callers pin this workflow by commit SHA (EQS §1 rule 5 — no mutable refs in CI).
 #
-# RUNNERS: GitHub bills the CALLER of a reusable workflow, not the repo that defines it. This repo
-# is public (its own runs are free), but a PRIVATE caller spends its own org's Actions allowance on
-# every job below. When that allowance is exhausted the jobs are refused a runner and fail in ~2s
-# with zero steps executed — a red check that looks like a gate failure but is really a gate that
-# never ran. `runs-on` exists so such a caller can move the floor onto the estate CI appliance
-# instead of losing it. The default stays GitHub-hosted so public and fork-PR callers are unaffected.
+# RUNNERS: reusable jobs are billed to their caller. Avenra is the permanent default;
+# billing resets do not change runner placement. The retired `[self-hosted, avenra-ci]`
+# pool is not a valid target. Public callers need access to an approved isolated Avenra
+# runner group before enabling these gates; never expose a shared credential lane to forks.
 
 on:
   workflow_call:
     inputs:
       runs-on:
         description: >-
-          Runner target for BOTH gate jobs — a single label ("ubuntu-latest") or a JSON array of
-          labels ('["self-hosted", "avenra-ci"]').
-
-          Defaults to GitHub-hosted ubuntu-latest. Leave it at the default for PUBLIC callers
-          (hosted minutes are free) and for any caller that accepts FORK pull requests — untrusted
-          contributor code must never be scheduled onto the shared self-hosted appliance.
-
-          A PRIVATE caller whose org has exhausted its hosted Actions allowance should pass
-          '["self-hosted", "avenra-ci"]' to run the floor on the estate CI appliance
-          (AvenraCloud/avenra-infra infra/ci-runner, docs/SELF-HOSTED-RUNNERS.md). Both jobs below
-          hold nothing beyond the default read-only GITHUB_TOKEN, which makes them box-eligible
-          under the estate runner rule.
+          Avenra runner target for both gate jobs. Defaults to avenra-ci-k8s.
+          Accepts a scalar label or JSON array. Use an approved isolated lane for public callers.
         type: string
         required: false
-        default: ubuntu-latest
+        default: avenra-ci-k8s
 
 permissions:
   contents: read
