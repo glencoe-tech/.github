@@ -64,9 +64,23 @@ jobs:
     runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Build on the Node the repo declares (.nvmrc, then .node-version), as its own CI and its
+      # deploy do. A hard-coded version passed or failed repos on a runtime they never run on
+      # (urbanova-fest pins 24; Node 20 could not load its build script). Repos that declare
+      # nothing get the current LTS, never an end-of-life line (Node 20 ended 2026-04-30).
+      - name: resolve the repo's Node version
+        id: node
+        run: |
+          set -euo pipefail
+          for f in .nvmrc .node-version; do
+            if [ -f "$f" ]; then echo "file=$f" >> "$GITHUB_OUTPUT"; echo "Node from $f: $(cat "$f")"; exit 0; fi
+          done
+          echo "version=24" >> "$GITHUB_OUTPUT"
+          echo "::notice::no .nvmrc or .node-version — building on Node 24 (LTS); declare the repo's runtime"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "20"
+          node-version-file: ${{ steps.node.outputs.file }}
+          node-version: ${{ steps.node.outputs.version }}
       - name: build if buildable — never silently skip
         run: |
           set -euo pipefail
