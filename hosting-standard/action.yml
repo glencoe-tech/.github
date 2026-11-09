@@ -1,0 +1,24 @@
+name: hosting-standard
+description: >-
+  Right-sized hosting check (glencoe-tech/governance docs/HOSTING-COST-STANDARD.md): no
+  run_worker_first true, a README `## Hosting` record naming a tier, and a Cloudflare
+  configuration that matches it. Passes repositories with no Cloudflare config.
+  Reference by full commit SHA: glencoe-tech/.github/hosting-standard@<sha>.
+
+# A composite action, like api-contract: the script that runs is exactly the one at the SHA the
+# caller pinned, read from $GITHUB_ACTION_PATH. Standard-library Python only.
+
+inputs:
+  path:
+    description: Repository root to check.
+    required: false
+    default: "."
+
+runs:
+  using: composite
+  steps:
+    - name: check the hosting tier
+      shell: bash
+      env:
+        CHECK_PATH: ${{ inputs.path }}
+      run: python3 "${GITHUB_ACTION_PATH}/hosting_standard.py" "${CHECK_PATH}"
