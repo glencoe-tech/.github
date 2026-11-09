@@ -23,19 +23,11 @@ on:
         default: avenra-ci-k8s
       npm-scope:
         description: >-
-          npm scope installed from GitHub Packages (e.g. "@glencoe-tech"). Empty: public registry
-          only. Needs the npm-registry-token secret.
+          npm scope installed from GitHub Packages (e.g. "@glencoe-tech"), read with the job's
+          GITHUB_TOKEN. Empty: public registry only, and the token is never handed to npm.
         type: string
         required: false
         default: ""
-    secrets:
-      npm-registry-token:
-        description: >-
-          Token for GitHub Packages when npm-scope is set: the caller passes its own
-          secrets.GITHUB_TOKEN from a job that grants `packages: read`. Not a GitHub App token:
-          npm.pkg.github.com rejects those (measured in axentra-atlas, 2026-08-20). This
-          workflow requests no permission beyond `contents: read`; the caller opts in.
-        required: false
 
 permissions:
   contents: read
@@ -77,6 +69,14 @@ jobs:
     name: build (must succeed on PR)
     # A JSON array is decoded into a label list; a bare label is passed through as a string.
     runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    # packages: read lets a repo install its private @scope from GitHub Packages (npm-scope). It
+    # cannot come from the caller: a token passed in is capped by this workflow's contents: read
+    # (403, measured in axentra-atlas 2026-11-09). A caller that sets `permissions:` itself must
+    # grant `packages: read` too, or the run refuses to start. Registry auth is the one
+    # GITHUB_TOKEN exception: npm.pkg.github.com rejects GitHub App tokens (measured 2026-08-20).
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Build on the Node the repo declares (.nvmrc, then .node-version), as its own CI and its
@@ -104,14 +104,9 @@ jobs:
       # different tree than the one it ships and failed builds its deploy passes (afroswitch).
       - name: build if buildable — never silently skip
         env:
-          NPM_SCOPE: ${{ inputs.npm-scope }}
-          NODE_AUTH_TOKEN: ${{ secrets.npm-registry-token }}
+          NODE_AUTH_TOKEN: ${{ inputs.npm-scope != '' && github.token || '' }}
         run: |
           set -euo pipefail
-          if [ -n "$NPM_SCOPE" ] && [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::npm-scope is $NPM_SCOPE but no npm-registry-token was passed; grant packages: read on the calling job and pass secrets.GITHUB_TOKEN"
-            exit 1
-          fi
           if [ -f package.json ] && node -e "process.exit(((require('./package.json').scripts||{}).build)?0:1)"; then
             echo "package.json build script detected"
             if [ -f pnpm-lock.yaml ]; then
