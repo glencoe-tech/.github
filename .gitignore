@@ -1,0 +1,3 @@
+# Python bytecode written by running the hosting-standard tests locally
+__pycache__/
+*.pyc
