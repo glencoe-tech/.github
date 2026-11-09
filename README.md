@@ -12,8 +12,18 @@ shared workflows other repositories call. It holds no product code.
 | [`ENGINEERING-QUALITY-STANDARD.md`](ENGINEERING-QUALITY-STANDARD.md) | The quality contract every repository inherits: fail-closed CI, pinned tooling, PRs not pushes, secrets never in repositories, Terraform-only infrastructure | Every contributor and every CI gate |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | The working agreement around the standard: the PR flow, the hard rules, how to bring a repository into contract | Read before a first pull request |
 | [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) | The organization's issue forms, one per work type, and `config.yml` | Anyone opening an issue in a repository without its own forms |
-| [`.github/workflows/repo-minimum-gates.yml`](.github/workflows/repo-minimum-gates.yml) | The reusable EQS floor: a full-history secret scan and a build that must succeed | Repositories that call it, pinned by SHA |
+| [`.github/workflows/repo-minimum-gates.yml`](.github/workflows/repo-minimum-gates.yml) | The reusable EQS floor, three jobs: a full-history gitleaks secret scan, a build that must succeed (on the repository's declared Node version), and the hosting-standard check. Jobs run on the `avenra-ci-k8s` runner lane unless the caller passes `runs-on` | Repositories that call it, pinned by SHA |
+| [`hosting-standard/`](hosting-standard/README.md) | The check behind the right-sized hosting standard: reads every `wrangler` config and the README's `## Hosting` record and fails when the declared tier does not match the config | `repo-minimum-gates.yml`, or a repository directly, pinned by SHA |
 | [`api-contract/`](api-contract/README.md) | The API contract check (GACS-1): validates, lints and compares an OpenAPI 3.1 contract with its last release, and proves a generated SDK reproduces | Repositories that use it, pinned by SHA |
+
+`hosting-standard/` and `api-contract/` each have a self-test workflow
+(`hosting-standard-selftest.yml`, `api-contract-selftest.yml`) that runs on pull requests and on
+pushes to `main`. To run the tests locally:
+
+```sh
+python3 -m unittest discover -s hosting-standard/tests
+make -C api-contract test        # installs the pinned toolchain, then runs every self-test case
+```
 
 ## Issue forms
 
