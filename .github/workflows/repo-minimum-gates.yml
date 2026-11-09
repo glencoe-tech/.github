@@ -21,6 +21,13 @@ on:
         type: string
         required: false
         default: avenra-ci-k8s
+      npm-scope:
+        description: >-
+          npm scope installed from GitHub Packages (e.g. "@glencoe-tech"), read with the job's
+          GITHUB_TOKEN. Empty: public registry only, and the token is never handed to npm.
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -62,6 +69,14 @@ jobs:
     name: build (must succeed on PR)
     # A JSON array is decoded into a label list; a bare label is passed through as a string.
     runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    # packages: read lets a repo install its private @scope from GitHub Packages (npm-scope). It
+    # cannot come from the caller: a token passed in is capped by this workflow's contents: read
+    # (403, measured in axentra-atlas 2026-11-09). A caller that sets `permissions:` itself must
+    # grant `packages: read` too, or the run refuses to start. Registry auth is the one
+    # GITHUB_TOKEN exception: npm.pkg.github.com rejects GitHub App tokens (measured 2026-08-20).
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Build on the Node the repo declares (.nvmrc, then .node-version), as its own CI and its
@@ -81,16 +96,33 @@ jobs:
         with:
           node-version-file: ${{ steps.node.outputs.file }}
           node-version: ${{ steps.node.outputs.version }}
+          # Empty unless the caller opts in; setup-node then writes no registry config.
+          registry-url: ${{ inputs.npm-scope != '' && 'https://npm.pkg.github.com' || '' }}
+          scope: ${{ inputs.npm-scope }}
+      # Install the way the repo's own CI and deploy do: from its committed lockfile, with its
+      # package manager. Installing a pnpm repo with an unpinned `npm install` resolved a
+      # different tree than the one it ships and failed builds its deploy passes (afroswitch).
       - name: build if buildable — never silently skip
+        env:
+          NODE_AUTH_TOKEN: ${{ inputs.npm-scope != '' && github.token || '' }}
         run: |
           set -euo pipefail
           if [ -f package.json ] && node -e "process.exit(((require('./package.json').scripts||{}).build)?0:1)"; then
             echo "package.json build script detected"
-            if [ -f package-lock.json ]; then npm ci; else
-              echo "::warning::no package-lock.json — install is not reproducible; commit a lockfile (EQS rule 5)"
-              npm install
+            if [ -f pnpm-lock.yaml ]; then
+              # corepack runs the pnpm that package.json `packageManager` declares.
+              node -e "process.exit(/^pnpm@/.test(require('./package.json').packageManager||'')?0:1)" ||
+                echo "::warning::pnpm-lock.yaml but no \"packageManager\": \"pnpm@<version>\" in package.json — the pnpm version is not pinned; declare it"
+              corepack enable
+              pnpm install --frozen-lockfile
+              pnpm run build
+            else
+              if [ -f package-lock.json ]; then npm ci; else
+                echo "::warning::no lockfile — install is not reproducible; commit one (EQS rule 5)"
+                npm install
+              fi
+              npm run build
             fi
-            npm run build
           elif [ -f index.html ] || [ -d public ] || [ -d dist ]; then
             echo "static site — no build step to run; secret scan is the effective gate"
           else
