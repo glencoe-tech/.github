@@ -96,3 +96,19 @@ jobs:
           else
             echo "::warning::no build script and no static entrypoint detected — declare this repo's tier and build story in its README (EQS §2)"
           fi
+
+  hosting-standard:
+    name: hosting standard (right-sized hosting tier)
+    # glencoe-tech/governance docs/HOSTING-COST-STANDARD.md: no run_worker_first true, a README
+    # `## Hosting` record naming a tier, and a Cloudflare config that matches it. Repositories with
+    # no Cloudflare config pass.
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: glencoe-tech/.github/hosting-standard@a00194bce398f74b92dc1ff3377cf683b562ab6e # PR #17
