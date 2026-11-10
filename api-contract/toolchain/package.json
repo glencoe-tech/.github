@@ -4,7 +4,7 @@
   "description": "Pinned Node toolchain for the api-contract action. Installed with npm ci from the committed lockfile.",
   "license": "UNLICENSED",
   "dependencies": {
-    "@stoplight/spectral-cli": "6.14.2",
-    "yaml": "2.8.4"
+    "@stoplight/spectral-cli": "6.17.1",
+    "yaml": "2.9.1"
   }
 }
