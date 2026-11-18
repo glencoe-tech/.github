@@ -158,6 +158,12 @@ class LinkTests(Base):
         self.repo.write({"import/x.md": "[a](missing.md)\n"})
         self.assertEqual(self.scan({"ignore": ["import/**"]}), [])
 
+    def test_code_under_templates_still_fires_rules(self) -> None:
+        raw = {"high_impact": [{"id": "auth", "paths": ["supabase/templates/**"], "docs": ["docs/THREAT.md"]}]}
+        found = self.pr({"supabase/templates/mfa.html": "a\n", "docs/THREAT.md": "# T\n"},
+                        {"supabase/templates/mfa.html": "b\n"}, "", raw)
+        self.assertEqual([(f.code, f.path) for f in found], [("D104", "supabase/templates/mfa.html")])
+
     def test_templates_are_always_ignored(self) -> None:
         self.repo.write({"work/templates/RUNBOOK.md": "[x](link)\n", ".github/pull_request_template.md": "[y](z)\n"})
         self.assertEqual(self.scan({"ignore": []}), [])

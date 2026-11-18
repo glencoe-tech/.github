@@ -32,8 +32,9 @@ or add `--base origin/main --body-file pr.md` to check a branch the way CI does.
 | W204 | advisory | A new Markdown file named like a task record, or placed outside the documentation locations. |
 | W205 | notice | A high-impact rule was satisfied by a waiver or a deferral instead of its documents. It is shown on the PR so a reviewer sees it; it never blocks. |
 
-Files under any `templates/` directory, and any `*template.md`, are always ignored: their links and
-fields are placeholders. `ignore` in the configuration adds to that list.
+Markdown files under any `templates/` directory, and any `*template.md`, are always ignored: their
+links and fields are placeholders. Other files under `templates/` are still checked and still fire
+high-impact rules. `ignore` in the configuration adds to that list.
 
 In a pull request, D101 and D102 look only at files the change touched, plus documents that named a
 file the change deleted or renamed. Existing debt is not charged to the next person who edits nearby.

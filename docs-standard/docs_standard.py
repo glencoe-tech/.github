@@ -29,8 +29,9 @@ DEFAULT_DOC_PATHS = [
     "README.md", "**/README.md", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "SECURITY.md",
     "CHANGELOG.md", "docs/**", ".github/**",
 ]
-# Templates hold placeholders, not links or real metadata. Always ignored, in addition to config.
-DEFAULT_IGNORE = ["**/templates/**", "**/*[Tt][Ee][Mm][Pp][Ll][Aa][Tt][Ee].md"]
+# Markdown templates hold placeholders, not links or real metadata. Always ignored, in addition to
+# config. Only Markdown: code under a templates/ directory (email templates, scaffolds) is still code.
+DEFAULT_IGNORE = ["**/templates/**/*.md", "**/*[Tt][Ee][Mm][Pp][Ll][Aa][Tt][Ee].md"]
 DEFAULT_GOVERNED = [
     {"glob": "**/adr/*.md", "class": "adr", "fields": ["status"]},
     {"glob": "**/*[Rr][Uu][Nn][Bb][Oo][Oo][Kk]*.md", "class": "runbook", "fields": ["owner"]},
