@@ -209,6 +209,10 @@ class DecisionIdTests(Base):
         found = self.scan()
         self.assertEqual([(f.code, f.path) for f in found], [("D103", "docs/adr/0001-b.md")])
 
+    def test_pr_reports_the_file_it_added(self) -> None:
+        found = self.pr({"docs/adr/0002-zeta.md": "**Status:** Accepted\n"}, {"docs/adr/0002-alpha.md": "**Status:** Proposed\n"})
+        self.assertEqual([(f.code, f.path) for f in found], [("D103", "docs/adr/0002-alpha.md")])
+
     def test_custom_pattern(self) -> None:
         self.repo.write({"docs/AX-RFC-0004-a.md": "", "docs/AX-RFC-0004-b.md": "", "docs/notes.md": ""})
         raw = {"decision_records": [{"glob": "docs/AX-RFC-*.md", "id": r"^AX-RFC-(\d{4})-"}]}

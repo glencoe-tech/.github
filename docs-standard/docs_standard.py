@@ -328,12 +328,13 @@ def check_metadata(root: Path, path: str, config: dict) -> list[Finding]:
     return findings
 
 
-def check_decision_ids(files: list[str], config: dict) -> list[Finding]:
+def check_decision_ids(files: list[str], config: dict, changed: set[str] | frozenset = frozenset()) -> list[Finding]:
+    """Changed files sort last, so a PR that reuses an id is told about its own file."""
     findings = []
     for rule in config["decision_records"]:
         pattern, ident = glob_regex(rule["glob"]), re.compile(rule["id"])
         seen: dict[tuple[str, str], str] = {}
-        for path in sorted(files):
+        for path in sorted(files, key=lambda p: (p in changed, p)):
             match = ident.match(Path(path).name) if pattern.match(path) else None
             if not match:
                 continue
@@ -482,12 +483,13 @@ def run(root: Path, base: str | None, body: str | None, config: dict, today: dt.
     tree = Tree(root, every)
     files = [p for p in every if not matches(p, config["ignore"])]
     markdown = [p for p in files if p.lower().endswith(".md")]
-    findings = check_decision_ids(files, config)
     if base is None:
+        findings = check_decision_ids(files, config)
         for path in markdown:
             findings += check_links(tree, path) + check_metadata(root, path, config)
         return apply_exceptions(findings, config, today)
     changes = {p: s for p, s in changed_files(root, base).items() if not matches(p, config["ignore"])}
+    findings = check_decision_ids(files, config, set(changes))
     live = sorted(p for p, s in changes.items() if s != "D")
     removed = [Path(p).name for p, s in changes.items() if s == "D"]
     scope = {p for p in live if p.lower().endswith(".md")}
