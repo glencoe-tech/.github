@@ -304,9 +304,20 @@ class CommentTests(unittest.TestCase):
         self.assertEqual(ds.check_comments("a.py", self.lines(single)), [])
 
     def test_prose_is_not_code(self) -> None:
-        prose = "# if the token is missing we refuse,\n# return 401 rather than leak existence\nx = 1\n"
-        self.assertEqual(ds.check_comments("a.py", self.lines(prose)), [])
-        self.assertTrue(ds.code_like("for item in items:"))
+        for prose in (
+            "# if the token is missing we refuse,\n# return 401 rather than leak existence\nx = 1\n",
+            "# KEYS[1] = bucket key\n# ARGV    = max_tokens, refill_rate (tokens/sec), now_seconds, cost\nx = 1\n",
+            "# from cache after it is off. `*` is distinct\n# from an explicit empty set.\nx = 1\n",
+            "# Error = the guard caught it;\n# IntegrityError = the unique index caught the racing insert.\nx = 1\n",
+            "#   Temporal UI:  http://localhost:8233\n#   Grafana:      http://localhost:3300\nx = 1\n",
+        ):
+            with self.subTest(prose=prose):
+                self.assertEqual(ds.check_comments("a.py", self.lines(prose)), [])
+        for code in ("for item in items:", "if (a) {", "else {", "def f(x):", "class A:", "let x = 1",
+                     "import os", "from a import b", "await save(x)", "print(x)", "console.log(x)",
+                     "foo.bar(x);", "});", "items.map((x) => {", "total += 1"):
+            with self.subTest(code=code):
+                self.assertTrue(ds.code_like(code))
 
     def test_history_comment(self) -> None:
         text = "// 2026-10-01: fixed the retry loop\nretry();\n# changed by @dev\nz = 1\n"
@@ -325,6 +336,8 @@ class CommentTests(unittest.TestCase):
             "#!/usr/bin/env python3\nimport os\n",
             "#\nx = 1\n",
             "# get user\n# get user\n",
+            "# ── Validate state ─────\nstate = validate_state(s)\n",
+            "# The old code returned a hardcoded value; updated by scripts/release.py\nx = 1\n",
         ):
             with self.subTest(text=text):
                 self.assertEqual(ds.check_comments("a.py", self.lines(text)), [])

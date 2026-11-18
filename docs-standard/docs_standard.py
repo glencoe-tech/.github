@@ -60,18 +60,25 @@ COMMENT_PREFIX = {
     ".ts": "//", ".tsx": "//", ".js": "//", ".jsx": "//", ".mjs": "//", ".go": "//",
     ".rs": "//", ".java": "//", ".kt": "//", ".swift": "//", ".c": "//", ".cc": "//",
 }
-KEYWORD_START = re.compile(
-    r"^(?:return|if|elif|else|for|while|def|class|const|let|var|import|from|func|await"
-    r"|resource|module|print|console\.\w+)\b"
+# Commented-out code: only strict statement shapes count, so prose that starts with "if", "from" or
+# "return", or documents a mapping like `KEYS[1] = bucket key`, is left alone.
+KEYWORD_CODE = re.compile(
+    r"^(?:return\b(?:\s+\S+){0,3};?$|(?:if|elif|while|for)\s*\(.*\)\s*\{?$|(?:if|elif|while)\s.+:$"
+    r"|for\s+\w+(?:,\s*\w+)*\s+in\s+.+:$|else\s*[:{]$|(?:def|func)\s+\w+\(|class\s+\w+[(:{]"
+    r"|(?:const|let|var)\s+\w+\s*[:=]|import\s+[\w{*]|from\s+[\w.]+\s+import\s|await\s+[\w.]+\("
+    r"|print\(|console\.\w+\()"
 )
-CODE_PUNCTUATION = re.compile(r"[(){}\[\]=;]")
-CODE_SHAPE = re.compile(r"(?:[;{}]$|^[\w.\[\]]+\s*[+\-*/]?=\s*\S|\w\([^)]*\);?$)")
+CODE_SHAPE = re.compile(
+    r"(?:^[\w.\[\]]+\s*[+\-*/]?=\s*(?:\S+|.*[)\]}])\s*;?$|^[\w.]+\(.*\)\s*;?$|^[})\]]+[;,]?$"
+    r"|^.*(?:\)|=>)\s*\{$)"
+)
+# Change history: a comment that opens with a date or version, or credits a change to a person.
 HISTORY = re.compile(
-    r"(?:\b20\d\d-\d\d-\d\d\b.*\b(?:fix|fixed|add|added|change|changed|remove|removed|update"
-    r"|updated|refactor|refactored|migrate|migrated)\b|\b(?:changed|modified|updated|fixed|added)"
-    r" by\b|\bold (?:code|version|implementation)\b)",
+    r"(?:^\[?(?:20\d\d-\d\d-\d\d|v\d+(?:\.\d+)+)\]?\s*[:\-–—]|\b(?:changed|modified|updated|fixed|added"
+    r"|removed)\s+by\s+@[\w-]+)",
     re.IGNORECASE,
 )
+DECORATION = re.compile(r"[─━═]{2,}|[-=*#]{4,}")
 INTENT_WORDS = re.compile(
     r"\b(?:because|why|must|never|always|only|note|warning|invariant|security|todo|fixme|hack"
     r"|safe|unsafe|assume|assumes|otherwise|so that|until|unless|see)\b",
@@ -414,9 +421,7 @@ def comment_body(line: str, prefix: str) -> str | None:
 
 
 def code_like(body: str) -> bool:
-    if KEYWORD_START.match(body):
-        return bool(CODE_PUNCTUATION.search(body)) or body.endswith(":") or len(body.split()) <= 2
-    return bool(CODE_SHAPE.search(body))
+    return bool(KEYWORD_CODE.match(body) or CODE_SHAPE.match(body))
 
 
 def words(text: str) -> list[str]:
@@ -444,7 +449,7 @@ def check_comments(path: str, lines: list[tuple[int, str]]) -> list[Finding]:
             findings.append(Finding("W202", path, number, "change history in a comment; it belongs in the commit message"))
         following = by_number.get(number + 1)
         said = [w for w in words(body) if w not in STOPWORDS]
-        if following and comment_body(following, prefix) is None and len(said) >= 2:
+        if following and comment_body(following, prefix) is None and len(said) >= 2 and not DECORATION.search(body):
             if not INTENT_WORDS.search(body) and set(said) <= set(words(following)):
                 findings.append(Finding("W203", path, number, "comment restates the next line; delete it or say why"))
     return findings
