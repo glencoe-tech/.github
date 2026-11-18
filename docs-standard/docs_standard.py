@@ -21,8 +21,9 @@ from pathlib import Path
 
 CONFIG_KEYS = {
     "version", "doc_paths", "ignore", "governed", "decision_records", "high_impact",
-    "protected", "exceptions",
+    "protected", "exceptions", "deferrals", "uncovered",
 }
+RULE_KEYS = {"id", "paths", "docs", "critical"}
 DOC_SUFFIXES = (".md", ".mdx", ".rst", ".adoc")
 DEFAULT_DOC_PATHS = [
     "README.md", "**/README.md", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "SECURITY.md",
@@ -38,6 +39,21 @@ DEFAULT_DECISION_RECORDS = [{"glob": "**/adr/*.md", "id": r"^(\d{3,5})-"}]
 ADR_STATUSES = {"proposed", "accepted", "superseded", "deprecated", "rejected"}
 EXCEPTION_KEYS = {"code", "path", "reason", "owner", "risk", "expires", "replacement"}
 MAX_EXCEPTION_DAYS = 180
+# A deferral postpones one rule's documentation to a named issue. It lives in the configuration, so it
+# is reviewed as a diff and expires; a PR description alone never defers anything.
+DEFERRAL_KEYS = {"rule", "issue", "reason", "owner", "expires"}
+MAX_DEFERRAL_DAYS = 30
+# Findings that an exception may never suppress: deferrals replace exceptions for D104, and an expiry
+# or a broken mapping cannot be excepted away.
+UNEXCEPTABLE = {"D104", "D107", "D108", "D109"}
+# Words that carry no reason on their own. A `none` reason needs MIN_REASON_WORDS words beyond these.
+GENERIC_WORDS = {
+    "a", "an", "and", "applicable", "as", "change", "changed", "changes", "diff", "doc", "docs",
+    "documentation", "explanatory", "fix", "for", "impact", "in", "internal", "is", "it", "just",
+    "later", "minor", "n", "na", "need", "needed", "no", "none", "not", "nothing", "of", "on", "only",
+    "or", "pr", "refactor", "see", "self", "small", "tbd", "the", "this", "to", "todo", "trivial",
+}
+MIN_REASON_WORDS = 4
 
 IMPACT_LINE = re.compile(
     r"^[\s>*_-]*documentation impact[\s*_]*:[\s*_]*(none|updated|follow-up)\b(.*)$",
@@ -154,6 +170,7 @@ def load_config(root: Path, relative: str) -> dict:
     if unknown:
         raise ConfigError(f"{relative}: unknown keys {sorted(unknown)}")
     config = {
+        "path": relative,
         "doc_paths": raw.get("doc_paths", DEFAULT_DOC_PATHS),
         "ignore": DEFAULT_IGNORE + raw.get("ignore", []),
         "governed": raw.get("governed", DEFAULT_GOVERNED),
@@ -161,14 +178,35 @@ def load_config(root: Path, relative: str) -> dict:
         "high_impact": raw.get("high_impact", []),
         "protected": raw.get("protected", []),
         "exceptions": raw.get("exceptions", []),
+        "deferrals": raw.get("deferrals", []),
+        "uncovered": raw.get("uncovered", []),
     }
+    ids = set()
     for rule in config["high_impact"]:
-        if not {"id", "paths", "docs"} <= set(rule):
-            raise ConfigError(f"{relative}: high_impact rules need id, paths and docs")
+        if not {"id", "paths", "docs"} <= set(rule) or set(rule) - RULE_KEYS:
+            raise ConfigError(f"{relative}: high_impact rules need id, paths and docs (and optionally critical)")
+        if not isinstance(rule.get("critical", False), bool):
+            raise ConfigError(f"{relative}: high_impact '{rule['id']}': critical must be true or false")
+        if rule["id"] in ids:
+            raise ConfigError(f"{relative}: high_impact id '{rule['id']}' is used twice")
+        ids.add(rule["id"])
     for item in config["exceptions"]:
         if set(item) != EXCEPTION_KEYS:
             raise ConfigError(f"{relative}: exceptions need exactly {sorted(EXCEPTION_KEYS)}")
+        if item["code"] in UNEXCEPTABLE:
+            raise ConfigError(f"{relative}: {item['code']} cannot be excepted (use deferrals for D104)")
         dt.date.fromisoformat(item["expires"])
+    for item in config["deferrals"]:
+        if set(item) != DEFERRAL_KEYS:
+            raise ConfigError(f"{relative}: deferrals need exactly {sorted(DEFERRAL_KEYS)}")
+        if item["rule"] not in ids:
+            raise ConfigError(f"{relative}: deferral names unknown high_impact rule '{item['rule']}'")
+        if not ISSUE_REF.fullmatch(item["issue"]):
+            raise ConfigError(f"{relative}: deferral issue must be owner/repo#n, #n or an issue URL")
+        dt.date.fromisoformat(item["expires"])
+    for item in config["uncovered"]:
+        if set(item) != {"area", "reason"} or not all(str(v).strip() for v in item.values()):
+            raise ConfigError(f"{relative}: uncovered entries need a non-empty area and reason")
     return config
 
 
@@ -360,39 +398,75 @@ def impact_declaration(body: str) -> tuple[str, str] | None:
     return (match.group(1).lower(), match.group(2).strip(" -—–:")) if match else None
 
 
-def check_impact(changes: dict[str, str], body: str | None, config: dict) -> list[Finding]:
-    """The PR description is read only when a high-impact path changed without its mapped docs."""
-    if body is None:
-        return []
+def specific_reason(reason: str) -> bool:
+    """A reason says something only when enough of its words are not stock phrases like "no impact"."""
+    return len([w for w in re.findall(r"[a-z0-9]+", reason.lower()) if w not in GENERIC_WORDS]) >= MIN_REASON_WORDS
+
+
+def active_deferrals(config: dict, today: dt.date) -> tuple[dict[str, dict], list[Finding]]:
+    active, findings = {}, []
+    for item in config["deferrals"]:
+        expires = dt.date.fromisoformat(item["expires"])
+        if expires < today:
+            findings.append(Finding("D108", config["path"], 0, f"deferral for '{item['rule']}' expired on {expires}"))
+        elif (expires - today).days > MAX_DEFERRAL_DAYS:
+            findings.append(Finding("D108", config["path"], 0, f"deferral for '{item['rule']}' runs past {MAX_DEFERRAL_DAYS} days"))
+        else:
+            active[item["rule"]] = item
+    return active, findings
+
+
+def check_impact(changes: dict[str, str], body: str | None, config: dict, today: dt.date) -> list[Finding]:
+    """A high-impact path that changed without its mapped docs needs a recorded reason.
+
+    Changing a mapped document always satisfies a rule. Otherwise an active deferral in the
+    configuration satisfies any rule, and `none — <specific reason>` satisfies a non-critical rule.
+    Each accepted waiver or deferral is reported as W205, so a reviewer sees it. `updated` never
+    stands in for the mapped documents, and `follow-up` in a description defers nothing.
+    """
+    active, findings = active_deferrals(config, today)
     fired = []
     for rule in config["high_impact"]:
         hits = [p for p in changes if matches(p, rule["paths"]) and not is_doc(p, config)]
         if hits and not any(matches(p, rule["docs"]) for p in changes):
             fired.append((rule, hits[0]))
-    if not fired:
-        return []
+    if not fired or body is None:
+        return findings
     declared = impact_declaration(body)
-    if declared:
-        kind, detail = declared
-        docs_changed = any(is_doc(p, config) for p in changes)
-        if kind == "none" and not re.search(r"\w", detail):
-            problem = "'Documentation impact: none' needs a reason"
-        elif kind == "updated" and not docs_changed:
-            problem = "declares 'updated' but no documentation file changed"
-        elif kind == "follow-up" and not ISSUE_REF.search(detail):
-            problem = "'follow-up' needs an issue reference"
+    kind, detail = declared if declared else ("", "")
+    for rule, hit in fired:
+        docs = ", ".join(rule["docs"])
+        critical = rule.get("critical", False)
+        if rule["id"] in active:
+            item = active[rule["id"]]
+            findings.append(Finding("W205", hit, 0, f"documentation for '{rule['id']}' deferred to {item['issue']} until {item['expires']} ({item['owner']}): {item['reason']}"))
+            continue
+        if kind == "none" and not critical and specific_reason(detail):
+            findings.append(Finding("W205", hit, 0, f"documentation for '{rule['id']}' waived in the PR description: {detail}"))
+            continue
+        if critical:
+            problem = f"critical high-impact change ('{rule['id']}') needs its documentation ({docs}) in this PR, or an active deferral for it in {config['path']}"
+        elif kind == "none":
+            problem = f"'Documentation impact: none' for '{rule['id']}' needs a specific reason (at least {MIN_REASON_WORDS} words beyond stock phrases)"
+        elif kind == "updated":
+            problem = f"the documents updated are not the ones mapped for '{rule['id']}' ({docs}); update one of those, or correct the mapping in {config['path']}"
+        elif kind == "follow-up":
+            problem = f"a follow-up defers '{rule['id']}': record it under deferrals in {config['path']} (issue, owner, reason, expiry within {MAX_DEFERRAL_DAYS} days)"
         else:
-            return []
-        reasons = ", ".join(f"{rule['id']} ({hit})" for rule, hit in fired)
-        return [Finding("D104", "PR description", 0, f"{problem}; high-impact change: {reasons}")]
-    return [
-        Finding(
-            "D104", hit, 0,
-            f"high-impact change ({rule['id']}) without its documentation ({', '.join(rule['docs'])})"
-            " or a 'Documentation impact:' line in the PR description",
-        )
-        for rule, hit in fired
-    ]
+            problem = f"high-impact change ('{rule['id']}') without its documentation ({docs}) or a 'Documentation impact:' line in the PR description"
+        findings.append(Finding("D104", hit, 0, problem))
+    return findings
+
+
+def check_mappings(files: list[str], config: dict) -> list[Finding]:
+    """A high-impact glob that matches no tracked file is a blind spot or a typo."""
+    findings = []
+    for rule in config["high_impact"]:
+        for key in ("paths", "docs"):
+            for pattern in rule[key]:
+                if not any(glob_regex(pattern).match(f) for f in files):
+                    findings.append(Finding("D109", config["path"], 0, f"high_impact '{rule['id']}' {key} pattern '{pattern}' matches no tracked file"))
+    return findings
 
 
 def check_protected(root: Path, base: str, changes: dict[str, str], config: dict) -> list[Finding]:
@@ -489,12 +563,13 @@ def run(root: Path, base: str | None, body: str | None, config: dict, today: dt.
     files = [p for p in every if not matches(p, config["ignore"])]
     markdown = [p for p in files if p.lower().endswith(".md")]
     if base is None:
-        findings = check_decision_ids(files, config)
+        findings = check_decision_ids(files, config) + check_mappings(files, config)
+        findings += active_deferrals(config, today)[1]
         for path in markdown:
             findings += check_links(tree, path) + check_metadata(root, path, config)
         return apply_exceptions(findings, config, today)
     changes = {p: s for p, s in changed_files(root, base).items() if not matches(p, config["ignore"])}
-    findings = check_decision_ids(files, config, set(changes))
+    findings = check_decision_ids(files, config, set(changes)) + check_mappings(files, config)
     live = sorted(p for p, s in changes.items() if s != "D")
     removed = [Path(p).name for p, s in changes.items() if s == "D"]
     scope = {p for p in live if p.lower().endswith(".md")}
@@ -504,7 +579,7 @@ def run(root: Path, base: str | None, body: str | None, config: dict, today: dt.
         findings += check_links(tree, path)
         if changes.get(path) in {"A", "M"}:
             findings += check_metadata(root, path, config)
-    findings += check_impact(changes, body, config)
+    findings += check_impact(changes, body, config, today)
     findings += check_protected(root, base, changes, config)
     findings += check_new_docs(changes, config)
     for path in live:
@@ -529,7 +604,7 @@ def escape(value: str) -> str:
 def report(findings: list[Finding], mode: str, github: bool) -> str:
     lines = []
     for f in sorted(findings, key=lambda x: (x.code, x.path, x.line)):
-        level = "error" if f.blocking and mode == "enforce" else "warning"
+        level = "error" if f.blocking and mode == "enforce" else ("notice" if f.code == "W205" else "warning")
         where = f"{f.path}:{f.line}" if f.line else f.path
         lines.append(f"{f.code} {level.upper()} {where} {f.message}")
         if github:

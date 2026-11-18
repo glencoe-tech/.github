@@ -96,12 +96,30 @@ class ConfigTests(Base):
     def test_defaults_without_file(self) -> None:
         self.assertEqual(self.config()["doc_paths"], ds.DEFAULT_DOC_PATHS)
 
+    def test_valid_deferral_and_uncovered_load(self) -> None:
+        config = self.config({"high_impact": [{"id": "x", "paths": ["a"], "docs": ["b"], "critical": True}],
+                              "deferrals": [{"rule": "x", "issue": "https://github.com/o/r/issues/2", "reason": "r",
+                                             "owner": "@o", "expires": "2026-12-01"}],
+                              "uncovered": [{"area": "public API", "reason": "GACS-1 contract CI covers it"}]})
+        self.assertEqual(config["uncovered"][0]["area"], "public API")
+
     def test_rejections(self) -> None:
         for raw, needle in (
             ([], "object"),
             ({"surprise": 1}, "unknown keys"),
             ({"high_impact": [{"id": "x"}]}, "high_impact"),
             ({"exceptions": [{"code": "D101"}]}, "exceptions need"),
+            ({"high_impact": [{"id": "x", "paths": [], "docs": [], "level": "high"}]}, "optionally critical"),
+            ({"high_impact": [{"id": "x", "paths": [], "docs": [], "critical": "yes"}]}, "true or false"),
+            ({"high_impact": [{"id": "x", "paths": [], "docs": []}, {"id": "x", "paths": [], "docs": []}]}, "used twice"),
+            ({"exceptions": [{"code": "D104", "path": "*", "reason": "r", "owner": "o", "risk": "r",
+                              "expires": "2026-12-01", "replacement": "r"}]}, "cannot be excepted"),
+            ({"deferrals": [{"rule": "x"}]}, "deferrals need"),
+            ({"deferrals": [{"rule": "x", "issue": "#1", "reason": "r", "owner": "o", "expires": "2026-12-01"}]}, "unknown high_impact"),
+            ({"high_impact": [{"id": "x", "paths": [], "docs": []}],
+              "deferrals": [{"rule": "x", "issue": "later", "reason": "r", "owner": "o", "expires": "2026-12-01"}]}, "deferral issue"),
+            ({"uncovered": [{"area": "api", "reason": " "}]}, "uncovered entries"),
+            ({"uncovered": [{"area": "api"}]}, "uncovered entries"),
         ):
             with self.subTest(needle=needle), self.assertRaisesRegex(ds.ConfigError, needle):
                 self.config(raw)
@@ -220,52 +238,122 @@ class DecisionIdTests(Base):
 
 
 class ImpactTests(Base):
-    RULES = {"high_impact": [{"id": "schema", "paths": ["migrations/**"], "docs": ["docs/data/**"]}]}
+    SCHEMA = {"id": "schema", "paths": ["migrations/**"], "docs": ["docs/data/**"]}
+    AUTH = {"id": "auth", "paths": ["src/auth/**"], "docs": ["docs/THREAT-MODEL.md"], "critical": True}
+    BASE = {"migrations/001.sql": "create;\n", "docs/data/schema.md": "# Schema\n",
+            "src/auth/login.py": "x = 1\n", "docs/THREAT-MODEL.md": "# Threats\n", "src/a.py": "x = 1\n"}
+    SPECIFIC = "Documentation impact: none — adds an index; no column, owner, retention or query semantics change"
 
-    def change(self, body: str | None, extra: dict[str, str] | None = None) -> list[ds.Finding]:
-        after = {"migrations/002.sql": "alter;\n", **(extra or {})}
-        return self.pr({"migrations/001.sql": "create;\n"}, after, body, self.RULES)
+    def raw(self, *extra: dict, deferrals: list | None = None) -> dict:
+        raw: dict = {"high_impact": [self.SCHEMA, self.AUTH, *extra]}
+        if deferrals is not None:
+            raw["deferrals"] = deferrals
+        return raw
+
+    def change(self, body: str | None, after: dict[str, str] | None = None, raw: dict | None = None) -> list[ds.Finding]:
+        self.fresh()
+        after = after if after is not None else {"migrations/002.sql": "alter;\n"}
+        return self.pr(self.BASE, after, body, raw or self.raw())
+
+    def deferral(self, **overrides: str) -> dict:
+        item = {"rule": "auth", "issue": "glencoe-tech/x#12", "reason": "threat model rewrite in flight",
+                "owner": "@glencoe-tech/platform-team", "expires": "2026-12-01"}
+        return {**item, **overrides}
 
     def test_trivial_change_needs_nothing(self) -> None:
-        self.assertEqual(self.pr({"src/a.py": "x = 1\n"}, {"src/a.py": "x = 2\n"}, "", self.RULES), [])
+        self.assertEqual(self.change("", {"src/a.py": "x = 2\n"}), [])
+        self.assertEqual(self.change("Documentation impact: none — ", {"src/a.py": "x = 2\n"}), [])
 
     def test_high_impact_without_docs_or_declaration(self) -> None:
         found = self.change("Adds a column.")
         self.assertEqual([(f.code, f.path) for f in found], [("D104", "migrations/002.sql")])
+        self.assertIn("without its documentation", found[0].message)
 
     def test_satisfied_by_mapped_docs(self) -> None:
-        self.assertEqual(self.change("", {"docs/data/schema.md": "# Schema\n"}), [])
+        self.assertEqual(self.change("", {"migrations/002.sql": "x\n", "docs/data/schema.md": "# Schema v2\n"}), [])
+        self.assertEqual(self.change("", {"src/auth/login.py": "x = 2\n", "docs/THREAT-MODEL.md": "# v2\n"}), [])
 
-    def test_satisfied_by_valid_declarations(self) -> None:
-        for body in (
-            "Documentation impact: none — column is internal and unread",
-            "- **Documentation impact:** follow-up glencoe-tech/axentra-core#12",
-            "Documentation impact: follow-up https://github.com/o/r/issues/3",
-        ):
+    def test_specific_none_is_accepted_and_visible(self) -> None:
+        found = self.change(self.SPECIFIC)
+        self.assertEqual([(f.code, f.path) for f in found], [("W205", "migrations/002.sql")])
+        self.assertIn("waived", found[0].message)
+        self.assertFalse(found[0].blocking)
+
+    def test_generic_none_reasons_are_refused(self) -> None:
+        for reason in ("", "n/a", "no impact", "internal only", "trivial change, no docs needed", "see diff"):
+            with self.subTest(reason=reason):
+                found = self.change(f"Documentation impact: none — {reason}")
+                self.assertEqual(codes(found), ["D104"])
+                self.assertIn("specific reason", found[0].message)
+
+    def test_follow_up_in_the_description_defers_nothing(self) -> None:
+        for body in ("- **Documentation impact:** follow-up glencoe-tech/axentra-core#12",
+                     "Documentation impact: follow-up https://github.com/o/r/issues/3"):
             with self.subTest(body=body):
-                self.fresh()
-                self.assertEqual(self.change(body), [])
+                found = self.change(body)
+                self.assertEqual(codes(found), ["D104"])
+                self.assertIn("record it under deferrals", found[0].message)
 
-    def test_invalid_declarations(self) -> None:
-        for body in ("Documentation impact: none", "Documentation impact: updated", "Documentation impact: follow-up later"):
-            with self.subTest(body=body):
-                self.fresh()
-                self.assertEqual(codes(self.change(body)), ["D104"])
-
-    def test_updated_with_other_docs_passes(self) -> None:
-        self.assertEqual(self.change("Documentation impact: updated README", {"README.md": "b\n"}), [])
-
-    def test_unfilled_template_line_on_a_trivial_change_is_ignored(self) -> None:
-        found = self.pr({"src/a.py": "x = 1\n"}, {"src/a.py": "x = 2\n"}, "Documentation impact: none — ", self.RULES)
-        self.assertEqual(found, [])
+    def test_updated_must_be_the_mapped_documents(self) -> None:
+        found = self.change("Documentation impact: updated README.md", {"migrations/002.sql": "x\n", "README.md": "b\n"})
+        self.assertEqual(codes(found), ["D104"])
+        self.assertIn("not the ones mapped for 'schema'", found[0].message)
 
     def test_workflow_files_are_not_documentation(self) -> None:
-        raw = {"high_impact": [{"id": "ci", "paths": [".github/workflows/**"], "docs": ["docs/ci/**"]}]}
-        found = self.pr({}, {".github/workflows/ci.yml": "on: push\n"}, "Documentation impact: updated", raw)
-        self.assertEqual([(f.code, f.path) for f in found], [("D104", "PR description")])
+        ci = {"id": "ci", "paths": [".github/workflows/**"], "docs": ["docs/data/**"]}
+        found = self.change("", {".github/workflows/ci.yml": "on: push\n"}, self.raw(ci))
+        self.assertEqual([(f.code, f.path) for f in found], [("D104", ".github/workflows/ci.yml")])
+
+    def test_critical_rule_refuses_description_waivers(self) -> None:
+        for body in (self.SPECIFIC, "Documentation impact: updated README.md", "Documentation impact: follow-up #4", ""):
+            with self.subTest(body=body):
+                found = self.change(body, {"src/auth/login.py": "x = 2\n", "README.md": "b\n"})
+                self.assertEqual(codes(found), ["D104"])
+                self.assertIn("critical high-impact change ('auth')", found[0].message)
+
+    def test_active_deferral_satisfies_a_critical_rule_visibly(self) -> None:
+        found = self.change("", {"src/auth/login.py": "x = 2\n"}, self.raw(deferrals=[self.deferral()]))
+        self.assertEqual([(f.code, f.path) for f in found], [("W205", "src/auth/login.py")])
+        self.assertIn("deferred to glencoe-tech/x#12 until 2026-12-01", found[0].message)
+
+    def test_deferral_covers_only_its_own_rule(self) -> None:
+        found = self.change("", {"src/auth/login.py": "x = 2\n", "migrations/002.sql": "x\n"},
+                            self.raw(deferrals=[self.deferral()]))
+        self.assertEqual([(f.code, f.path) for f in found], [("D104", "migrations/002.sql"), ("W205", "src/auth/login.py")])
+
+    def test_expired_or_overlong_deferrals_fail_and_stop_covering(self) -> None:
+        for expires, needle in (("2026-11-01", "expired"), ("2027-01-31", "runs past 30 days")):
+            with self.subTest(expires=expires):
+                found = self.change("", {"src/auth/login.py": "x = 2\n"}, self.raw(deferrals=[self.deferral(expires=expires)]))
+                self.assertEqual(codes(found), ["D104", "D108"])
+                self.assertIn(needle, [f for f in found if f.code == "D108"][0].message)
+
+    def test_expired_deferral_is_reported_even_without_a_matching_change(self) -> None:
+        found = self.change("", {"src/a.py": "x = 2\n"}, self.raw(deferrals=[self.deferral(expires="2026-11-01")]))
+        self.assertEqual(codes(found), ["D108"])
 
     def test_no_pull_request_context_skips(self) -> None:
         self.assertEqual(self.change(None), [])
+
+    def test_specific_reason(self) -> None:
+        self.assertFalse(ds.specific_reason("not applicable, no docs needed for this trivial PR"))
+        self.assertTrue(ds.specific_reason("index only; column, owner and retention unchanged"))
+
+
+class MappingTests(Base):
+    def test_unmatched_globs_are_reported_in_scan_and_pr(self) -> None:
+        self.repo.write({"migrations/001.sql": "x\n", "docs/data/a.md": "# A\n"})
+        raw = {"high_impact": [{"id": "s", "paths": ["migrations/**", "fly*.toml"], "docs": ["docs/data/**", "docs/gone.md"]}]}
+        found = self.scan(raw)
+        self.assertEqual([(f.code, f.path) for f in found], [("D109", ".github/docs-standard.json")] * 2)
+        self.assertIn("'fly*.toml' matches no tracked file", found[0].message)
+        self.assertEqual(codes(self.pr({}, {"src/x.py": "y\n"}, "", raw)), ["D109", "D109"])
+
+    def test_expired_deferral_in_scan(self) -> None:
+        self.repo.write({"src/a.py": "x\n", "docs/a.md": "# A\n"})
+        raw = {"high_impact": [{"id": "s", "paths": ["src/**"], "docs": ["docs/a.md"]}],
+               "deferrals": [{"rule": "s", "issue": "#1", "reason": "r", "owner": "@o", "expires": "2026-11-01"}]}
+        self.assertEqual(codes(self.scan(raw)), ["D108"])
 
 
 class ProtectedTests(Base):
@@ -432,13 +520,13 @@ class CliTests(Base):
 
     def test_body_file_and_errors(self) -> None:
         rule = {"high_impact": [{"id": "x", "paths": ["x.txt"], "docs": ["docs/**"]}]}
-        base = self.repo.commit({"x.txt": "a\n", ".github/docs-standard.json": json.dumps(rule)})
+        base = self.repo.commit({"x.txt": "a\n", "docs/x.md": "# X\n", ".github/docs-standard.json": json.dumps(rule)})
         self.repo.commit({"x.txt": "b\n"})
         body = self.repo.root.parent / f"{self.repo.root.name}-body.md"
         self.addCleanup(lambda: body.unlink(missing_ok=True))
         body.write_text("Documentation impact: none\n", encoding="utf-8")
         code, out, _ = self.call("--base", base, "--body-file", str(body))
-        self.assertIn("needs a reason", out)
+        self.assertIn("needs a specific reason", out)
         self.repo.write({".github/docs-standard.json": "{\"nope\": 1}"})
         self.assertEqual(self.call()[0], 2)
         self.repo.write({".github/docs-standard.json": "{}"})
@@ -453,6 +541,11 @@ class CliTests(Base):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("D101 ERROR README.md:1", result.stdout)
+
+    def test_waivers_are_notices_never_errors(self) -> None:
+        out = ds.report([ds.Finding("W205", "a.py", 0, "waived")], "enforce", True)
+        self.assertIn("::notice title=W205::waived", out)
+        self.assertIn("0 objective and 1 advisory", out)
 
     def test_escape(self) -> None:
         self.assertEqual(ds.escape("a%\r\nb"), "a%25%0D%0Ab")
