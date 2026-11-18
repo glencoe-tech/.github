@@ -92,7 +92,7 @@ reference. Workflow files under `.github/` are not documentation. Only `.md`, `.
 - The base SHA and PR description come from `$GITHUB_EVENT_PATH`. They are parsed as data and never
   interpolated into a shell, so a hostile description cannot run anything.
 - It needs `contents: read` only. It holds no secrets and makes no network calls, so fork PRs are safe.
-- It reads files and `git diff`. On the 18 glencoe-tech repositories a full scan takes 0.26–0.47 s.
+- It reads files and `git diff`. On the 19 glencoe-tech repositories a full scan takes 0.26–0.47 s.
 - To be safe on pull requests, add `edited` to the `pull_request` types. Then fixing the description
   re-runs the check.
 
