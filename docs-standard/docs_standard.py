@@ -375,7 +375,8 @@ def check_impact(changes: dict[str, str], body: str | None, config: dict) -> lis
             problem = "'follow-up' needs an issue reference"
         else:
             return []
-        return [Finding("D104", "PR description", 0, problem)]
+        reasons = ", ".join(f"{rule['id']} ({hit})" for rule, hit in fired)
+        return [Finding("D104", "PR description", 0, f"{problem}; high-impact change: {reasons}")]
     return [
         Finding(
             "D104", hit, 0,
