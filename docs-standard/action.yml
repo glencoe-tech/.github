@@ -1,0 +1,38 @@
+name: docs-standard
+description: >-
+  Documentation checks behind GEDS-001 (glencoe-tech/governance
+  docs/ENGINEERING-DOCUMENTATION-STANDARD.md): link integrity, governed-document metadata, unique
+  decision-record ids, documentation impact for high-impact changes, protected-document versions, and
+  advisory comment and sprawl warnings. Reference by full commit SHA: glencoe-tech/.github/docs-standard@<sha>.
+
+# A composite action, like hosting-standard: the script that runs is exactly the one at the SHA the
+# caller pinned, read from $GITHUB_ACTION_PATH. Standard-library Python only. On a pull_request event
+# the base SHA and the PR description are read from the event file, so untrusted PR text never reaches
+# a shell. The caller checks out with fetch-depth 0 so the base commit is present.
+
+inputs:
+  path:
+    description: Repository root to check.
+    required: false
+    default: "."
+  mode:
+    description: >-
+      warn (default): every finding is an annotation and the step passes. enforce: objective findings
+      (D codes) fail the step; advisory findings (W codes) never do. Enforce needs CTO approval (GEDS-001 §12).
+    required: false
+    default: warn
+  config:
+    description: Repository configuration, relative to path. Missing file means the defaults.
+    required: false
+    default: .github/docs-standard.json
+
+runs:
+  using: composite
+  steps:
+    - name: check documentation
+      shell: bash
+      env:
+        CHECK_PATH: ${{ inputs.path }}
+        CHECK_MODE: ${{ inputs.mode }}
+        CHECK_CONFIG: ${{ inputs.config }}
+      run: python3 "${GITHUB_ACTION_PATH}/docs_standard.py" "${CHECK_PATH}" --github --mode "${CHECK_MODE}" --config "${CHECK_CONFIG}"
