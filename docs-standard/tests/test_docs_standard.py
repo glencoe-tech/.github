@@ -242,15 +242,19 @@ class ImpactTests(Base):
         for body in ("Documentation impact: none", "Documentation impact: updated", "Documentation impact: follow-up later"):
             with self.subTest(body=body):
                 self.fresh()
-                self.assertEqual(codes(self.change(body)), ["D104", "D104"])
+                self.assertEqual(codes(self.change(body)), ["D104"])
 
-    def test_updated_with_docs_passes(self) -> None:
-        found = self.pr({"README.md": "a\n"}, {"README.md": "b\n"}, "Documentation impact: updated README")
+    def test_updated_with_other_docs_passes(self) -> None:
+        self.assertEqual(self.change("Documentation impact: updated README", {"README.md": "b\n"}), [])
+
+    def test_unfilled_template_line_on_a_trivial_change_is_ignored(self) -> None:
+        found = self.pr({"src/a.py": "x = 1\n"}, {"src/a.py": "x = 2\n"}, "Documentation impact: none — ", self.RULES)
         self.assertEqual(found, [])
 
     def test_workflow_files_are_not_documentation(self) -> None:
-        found = self.pr({}, {".github/workflows/ci.yml": "on: push\n"}, "Documentation impact: updated")
-        self.assertEqual(codes(found), ["D104"])
+        raw = {"high_impact": [{"id": "ci", "paths": [".github/workflows/**"], "docs": ["docs/ci/**"]}]}
+        found = self.pr({}, {".github/workflows/ci.yml": "on: push\n"}, "Documentation impact: updated", raw)
+        self.assertEqual([(f.code, f.path) for f in found], [("D104", "PR description")])
 
     def test_no_pull_request_context_skips(self) -> None:
         self.assertEqual(self.change(None), [])
@@ -406,7 +410,8 @@ class CliTests(Base):
         self.assertEqual(ds.event_context(None), (None, None))
 
     def test_body_file_and_errors(self) -> None:
-        base = self.repo.commit({"x.txt": "a\n"})
+        rule = {"high_impact": [{"id": "x", "paths": ["x.txt"], "docs": ["docs/**"]}]}
+        base = self.repo.commit({"x.txt": "a\n", ".github/docs-standard.json": json.dumps(rule)})
         self.repo.commit({"x.txt": "b\n"})
         body = self.repo.root.parent / f"{self.repo.root.name}-body.md"
         self.addCleanup(lambda: body.unlink(missing_ok=True))

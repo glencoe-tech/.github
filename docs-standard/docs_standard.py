@@ -351,31 +351,37 @@ def impact_declaration(body: str) -> tuple[str, str] | None:
 
 
 def check_impact(changes: dict[str, str], body: str | None, config: dict) -> list[Finding]:
-    """A declaration is needed only when a configured high-impact path changed without its docs."""
+    """The PR description is read only when a high-impact path changed without its mapped docs."""
     if body is None:
         return []
-    docs_changed = any(is_doc(p, config) for p in changes)
-    declared = impact_declaration(body)
-    findings = []
-    if declared:
-        kind, detail = declared
-        if kind == "none" and not re.search(r"\w", detail):
-            findings.append(Finding("D104", "PR description", 0, "'Documentation impact: none' needs a reason"))
-        elif kind == "updated" and not docs_changed:
-            findings.append(Finding("D104", "PR description", 0, "declares 'updated' but no documentation file changed"))
-        elif kind == "follow-up" and not ISSUE_REF.search(detail):
-            findings.append(Finding("D104", "PR description", 0, "'follow-up' needs an issue reference"))
-    valid = declared is not None and not findings
+    fired = []
     for rule in config["high_impact"]:
         hits = [p for p in changes if matches(p, rule["paths"]) and not is_doc(p, config)]
-        if not hits or valid or any(matches(p, rule["docs"]) for p in changes):
-            continue
-        findings.append(Finding(
-            "D104", hits[0], 0,
+        if hits and not any(matches(p, rule["docs"]) for p in changes):
+            fired.append((rule, hits[0]))
+    if not fired:
+        return []
+    declared = impact_declaration(body)
+    if declared:
+        kind, detail = declared
+        docs_changed = any(is_doc(p, config) for p in changes)
+        if kind == "none" and not re.search(r"\w", detail):
+            problem = "'Documentation impact: none' needs a reason"
+        elif kind == "updated" and not docs_changed:
+            problem = "declares 'updated' but no documentation file changed"
+        elif kind == "follow-up" and not ISSUE_REF.search(detail):
+            problem = "'follow-up' needs an issue reference"
+        else:
+            return []
+        return [Finding("D104", "PR description", 0, problem)]
+    return [
+        Finding(
+            "D104", hit, 0,
             f"high-impact change ({rule['id']}) without its documentation ({', '.join(rule['docs'])})"
             " or a 'Documentation impact:' line in the PR description",
-        ))
-    return findings
+        )
+        for rule, hit in fired
+    ]
 
 
 def check_protected(root: Path, base: str, changes: dict[str, str], config: dict) -> list[Finding]:
