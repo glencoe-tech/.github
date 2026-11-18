@@ -17,10 +17,24 @@ Repository instructions may be stricter; they may not weaken that standard.
 - Evidence outranks assertion. Distinguish DECLARED, BUILT, TESTED, DEPLOYED, OBSERVED, and PROVEN.
 - Agents document the system, not their activity. Do not add session diaries, completion reports,
   copied logs, or task-history Markdown.
+- Read the documentation of what you change; update existing documents rather than adding new ones;
+  state `Documentation impact:` in the PR; never claim documentation is published or verified without
+  evidence. Rules: [GEDS-001](https://github.com/glencoe-tech/governance/blob/main/docs/ENGINEERING-DOCUMENTATION-STANDARD.md).
 - Couple material architecture, contract, security, persistence, failure, recovery, operational, and
   deployment changes with the relevant durable documentation and executable proof.
 - Prefer tests, schemas, types, policy, validation, and generated references over duplicated prose.
 - Preserve repository-specific architecture and conventions; standardize behavior, not filenames.
+- **Environment lifecycle is part of completion.** Use the declared Docker/container environment
+  for dependency installation, builds, testing, and packaging. A necessary native/local fallback
+  must be isolated, explained, and cleaned to the same standard.
+- **Agent-created resources are task-scoped.** Establish ownership and teardown before creation.
+  On success, failure, cancellation, or interruption, export requested deliverables and remove owned
+  containers, disposable volumes, temporary images/build caches, VMs, worktrees, local environments,
+  dependencies, and generated output. Preserve source, Git history, secrets, persistent data, and
+  pre-existing/shared resources. Retention needs explicit authorization, an owner, and an expiry.
+- **Verify teardown before PASS.** Use guaranteed cleanup handlers and expiry/reaping for resources
+  that can outlive a job. Include cleanup evidence in PROOF; unresolved cleanup is PARTIAL/BLOCKED
+  with the remaining resource, owner, expiry, and removal command in RISKS / REMAINING.
 - Stop after acceptance criteria and proportionate verification pass. Report genuine blockers plainly.
 
 Final responses use `RESULT: PASS | PARTIAL | BLOCKED | FAIL`, then concise `CHANGES`, `PROOF`,
