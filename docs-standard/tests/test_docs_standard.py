@@ -140,6 +140,10 @@ class LinkTests(Base):
         self.repo.write({"import/x.md": "[a](missing.md)\n"})
         self.assertEqual(self.scan({"ignore": ["import/**"]}), [])
 
+    def test_templates_are_always_ignored(self) -> None:
+        self.repo.write({"work/templates/RUNBOOK.md": "[x](link)\n", ".github/pull_request_template.md": "[y](z)\n"})
+        self.assertEqual(self.scan({"ignore": []}), [])
+
     def test_pr_rechecks_docs_that_named_a_removed_file(self) -> None:
         found = self.pr(
             {"docs/old.md": "# Old\n", "README.md": "[o](docs/old.md)\n", "docs/other.md": "plain\n"},

@@ -28,6 +28,8 @@ DEFAULT_DOC_PATHS = [
     "README.md", "**/README.md", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "SECURITY.md",
     "CHANGELOG.md", "docs/**", ".github/**",
 ]
+# Templates hold placeholders, not links or real metadata. Always ignored, in addition to config.
+DEFAULT_IGNORE = ["**/templates/**", "**/*[Tt][Ee][Mm][Pp][Ll][Aa][Tt][Ee].md"]
 DEFAULT_GOVERNED = [
     {"glob": "**/adr/*.md", "class": "adr", "fields": ["status"]},
     {"glob": "**/*[Rr][Uu][Nn][Bb][Oo][Oo][Kk]*.md", "class": "runbook", "fields": ["owner"]},
@@ -146,7 +148,7 @@ def load_config(root: Path, relative: str) -> dict:
         raise ConfigError(f"{relative}: unknown keys {sorted(unknown)}")
     config = {
         "doc_paths": raw.get("doc_paths", DEFAULT_DOC_PATHS),
-        "ignore": raw.get("ignore", []),
+        "ignore": DEFAULT_IGNORE + raw.get("ignore", []),
         "governed": raw.get("governed", DEFAULT_GOVERNED),
         "decision_records": raw.get("decision_records", DEFAULT_DECISION_RECORDS),
         "high_impact": raw.get("high_impact", []),

@@ -29,6 +29,9 @@ or add `--base origin/main --body-file pr.md` to check a branch the way CI does.
 | W203 | advisory | A comment whose words all appear in the next line of code. |
 | W204 | advisory | A new Markdown file named like a task record, or placed outside the documentation locations. |
 
+Files under any `templates/` directory, and any `*template.md`, are always ignored: their links and
+fields are placeholders. `ignore` in the configuration adds to that list.
+
 In a pull request, D101 and D102 look only at files the change touched, plus documents that named a
 file the change deleted or renamed. Existing debt is not charged to the next person who edits nearby.
 A whole-repository scan (no `--base`) reports all of it, for audits.
