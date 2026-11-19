@@ -1,0 +1,35 @@
+name: Documentation standard
+
+# GEDS-001 (glencoe-tech/governance docs/ENGINEERING-DOCUMENTATION-STANDARD.md). Warn-only:
+# findings are annotations and the job passes. Mappings live in .github/docs-standard.json. `edited`
+# re-runs the check when the PR description's "Documentation impact:" line changes.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-standard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    name: documentation standard (warn)
+    # This repository is public: the avenra-ci-k8s runner group does not serve public repositories,
+    # so its own jobs run on GitHub-hosted runners (ENGINEERING-QUALITY-STANDARD.md §2 standing exception).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the check diffs against the PR base commit
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+      - uses: glencoe-tech/.github/docs-standard@162e0b9d702790bcec44e748ed5af0eac5aee9c1 # glencoe-tech/.github#24 merge commit
+        with:
+          mode: warn
