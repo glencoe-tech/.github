@@ -23,6 +23,15 @@ Repository instructions may be stricter; they may not weaken that standard.
 - Couple material architecture, contract, security, persistence, failure, recovery, operational, and
   deployment changes with the relevant durable documentation and executable proof.
 - Prefer tests, schemas, types, policy, validation, and generated references over duplicated prose.
+- **Know what an event triggers before you cause it.** Before pushing a branch or tag, opening or
+  updating a pull request, arming auto-merge, or merging, read what that event runs: workflow
+  triggers (including `pull_request_target`), path filters, `if:` conditions, environments, secrets,
+  git integrations such as Workers Builds or Pages, and anything that acts on it elsewhere
+  (`workflow_run`, dispatches, GitOps sync). If it can deploy, publish, apply infrastructure, restart
+  a service, or give the job production credentials, stop and report it; proceed only on the
+  accountable owner's explicit authorization for that event. A preview is safe only when no
+  production secret reaches the job and it serves no production traffic. A missing target or an
+  expected failure is not proof of safety.
 - Preserve repository-specific architecture and conventions; standardize behavior, not filenames.
 - **Environment lifecycle is part of completion.** Use the declared Docker/container environment
   for dependency installation, builds, testing, and packaging. A necessary native/local fallback
