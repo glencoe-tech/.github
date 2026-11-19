@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "high_impact": [
+    {
+      "id": "shared-ci-floor",
+      "critical": true,
+      "paths": [".github/workflows/repo-minimum-gates.yml"],
+      "docs": ["README.md", "ENGINEERING-QUALITY-STANDARD.md", "CONTRIBUTING.md"]
+    },
+    {
+      "id": "docs-standard-check",
+      "paths": ["docs-standard/action.yml", "docs-standard/docs_standard.py"],
+      "docs": ["docs-standard/README.md"]
+    },
+    {
+      "id": "hosting-standard-check",
+      "paths": ["hosting-standard/action.yml", "hosting-standard/hosting_standard.py"],
+      "docs": ["hosting-standard/README.md"]
+    },
+    {
+      "id": "api-contract-check",
+      "paths": ["api-contract/action.yml", "api-contract/src/**", "api-contract/rulesets/**", "api-contract/oasdiff/**"],
+      "docs": ["api-contract/README.md"]
+    }
+  ],
+  "uncovered": [
+    { "area": "Issue forms (.github/ISSUE_TEMPLATE/**)", "reason": "they are generated from the Product and Work Standard in glencoe-tech/governance; a change is made there and regenerated, not documented here" },
+    { "area": "Self-test workflows and test suites (*-selftest.yml, */tests/**, api-contract/fixtures/**)", "reason": "they are the executable proof of each check; a behaviour change shows up in the check's own files, which are mapped" },
+    { "area": "api-contract toolchain pins (api-contract/toolchain/**, api-contract/bin/**)", "reason": "Renovate updates them and the self-test proves every case against the new toolchain on each PR" }
+  ]
+}
