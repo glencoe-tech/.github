@@ -804,9 +804,10 @@ class IndexNow(unittest.TestCase):
         at_cap = {full(i): R(200, json.dumps({"artifacts": other}).encode()) for i in range(1, seo.LEDGER_PAGES + 1)}
         at_cap[full(seo.LEDGER_PAGES + 1)] = R(200, b'{"artifacts": []}')
         self.assertEqual(seo.fetch_ledger(http(at_cap)[0], "o/r", "tok", "main", name), (None, "none"))
-        endless = {**at_cap, full(seo.LEDGER_PAGES + 1): R(200, json.dumps({"artifacts": other}).encode())}
-        with self.assertRaisesRegex(ConnectionError, "delete old ledger artifacts"):
-            seo.fetch_ledger(http(endless)[0], "o/r", "tok", "main", name)
+        for extra in (1, 99, 100):  # 5,001, 5,099 and 5,100: all over the cap
+            over = {**at_cap, full(seo.LEDGER_PAGES + 1): R(200, json.dumps({"artifacts": other[:extra]}).encode())}
+            with self.assertRaisesRegex(ConnectionError, "delete old ledger artifacts"):
+                seo.fetch_ledger(http(over)[0], "o/r", "tok", "main", name)
         # A ledger.json holding JSON null is unreadable, not "no ledger".
         null = io.BytesIO()
         with zipfile.ZipFile(null, "w") as z:
@@ -845,10 +846,13 @@ class IndexNow(unittest.TestCase):
             with open(prev, "w") as f:
                 f.write(bad)
             self.assertIn("not a valid version-1 ledger", main(base + ["--ledger-in", prev], self.site()))
-        # A valid ledger whose first run never completed a baseline (the key was not served yet) is planned.
+        # A valid pending ledger with no reason (an earlier version's first run that never baselined)
+        # still warns once, generically: a loss before the upgrade cannot pass silently.
         with open(prev, "w") as f:
             json.dump({"version": 1, "host": "example.com", "initialized": False, "retry_after": "", "urls": {}, "log": []}, f)
-        self.assertNotIn("::warning", main(base + ["--ledger-in", prev], self.site()))
+        said = main(base + ["--ledger-in", prev], self.site())
+        self.assertIn("::warning title=IndexNow baseline::example.com: no earlier baseline was recorded", said)
+        self.assertEqual(said.count("::warning"), 1)
         # Expired, then a run that cannot read the key: the reason survives into the next ledger, and the
         # healthy run after it still warns.
         nokey = dict(t)

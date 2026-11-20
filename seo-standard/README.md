@@ -152,8 +152,9 @@ and `indexnow-key: <key>` under `with:`.
     last accepted them are not submitted. The reason stays in the ledger until a baseline
     completes, so a run that ends early (the key not served, say) does not lose the warning.
   - None is listed: also a new baseline with a warning. GitHub no longer lists expired artifacts, so
-    a first run after adoption and an expired ledger look the same. On the first run after
-    adoption the warning is expected.
+    a first run after adoption and an expired ledger look the same. Every completed baseline warns
+    exactly once, with the reason it started; on the first run after adoption the warning is
+    expected.
   - Over 5,000 ledger artifacts within retention: the run stops and warns rather than guess.
     Delete old ledger artifacts to recover.
   - The weekly schedule makes expiry unlikely, not impossible. GitHub can drop a scheduled run, and

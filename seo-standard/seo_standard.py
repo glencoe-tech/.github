@@ -816,8 +816,10 @@ def indexnow(canonical: str, sitemaps: list[str], key: str, ledger, http: "Http"
             new["urls"][u]["accepted"] = new["urls"][u]["fingerprint"]
         new["initialized"] = True
         record["baseline"] = True
-        if new.get("reset"):
-            record["unplanned"] = new.pop("reset")
+        # Every completed baseline is reported once: with the reason it started, or, for a ledger that
+        # never recorded one (an earlier version's pending first run), with the generic one.
+        record["unplanned"] = new.pop("reset", "") or ("no earlier baseline was recorded: starting a new one. That is "
+                                                       "expected on the first run after adoption")
         record["notes"].append(f"baseline: {len(pages)} eligible URLs recorded, nothing submitted")
         return done()
     changed = [u for u in pages if new["urls"][u]["accepted"] != new["urls"][u]["fingerprint"]
@@ -880,7 +882,9 @@ def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = L
     and skip every change since."""
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     listing: list = []
-    for n in range(1, LEDGER_PAGES + 2):  # one page past the cap, so exactly the cap still ends
+    n = 0
+    while True:  # every page, up to one past the cap, so exactly the cap still ends
+        n += 1
         r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={urllib.parse.quote(name)}"
                      f"&per_page=100&page={n}", hdrs)
         if r.status != 200:
@@ -892,9 +896,11 @@ def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = L
         if not isinstance(page, list):
             raise ConnectionError("the ledger artifact listing has no artifact list")
         listing += page
+        if len(listing) > LEDGER_PAGES * 100:
+            break  # over the cap: raise below rather than guess
         if len(page) < 100:
             break
-    else:
+    if len(listing) > LEDGER_PAGES * 100:
         raise ConnectionError(f"more than {LEDGER_PAGES * 100} ledger artifacts: the listing was not read to the end "
                               "(delete old ledger artifacts to recover)")
     ours = [a for a in listing if isinstance(a, dict) and a.get("name") == name
