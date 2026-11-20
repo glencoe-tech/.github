@@ -54,17 +54,19 @@ their own.
 - the homepage is not 200
 - `noindex` in production. Meta robots, or an `X-Robots-Tag` that applies to Googlebot or
   Bingbot; a tag scoped to another crawler, e.g. `googlebot-news:`, does not count
-- `robots.txt` disallows the homepage for Googlebot or Bingbot (RFC 9309 matching: wildcards,
-  `$`, longest rule in octets wins, Allow wins a tie, paths compared after percent-encoding
-  normalisation, so `/%70rivate` is `/private`), or answers 5xx/401/403/429 or redirects to an
-  unreachable host (Google then crawls nothing). Up to five redirects are followed, each resolved
-  against the URL that returned it
+- `robots.txt` disallows the homepage for Googlebot or Bingbot, or answers 429 or 5xx, which
+  Google treats as disallow-all.
+  - Matching follows RFC 9309: a crawler's own group, even an empty one, replaces `*`;
+    wildcards and `$` are honoured; the longest rule wins and Allow wins a tie; queries are kept;
+    percent-encoding is normalised.
+  - Redirects are followed for up to 5 hops.
 - `robots.txt` or a sitemap whose body is an HTML page (the SPA fallback)
 - a sitemap that is missing, invalid XML, not a sitemap, or lists URLs on another host
-- a sampled sitemap URL that is:
+- a sampled sitemap URL (up to 20 in production and artifact mode, 5 in preview, spread evenly
+  across the whole sitemap with the first and last always included) that is:
   - not a 200 (redirects count)
   - `noindex`
-  - disallowed by robots.txt (path and query)
+  - disallowed by robots.txt for Googlebot or Bingbot
   - declaring another page as its canonical
 - the homepage's `rel=canonical` pointing anywhere but the production URL
 - `http://` or the other `www` form not ending at the canonical URL
@@ -74,22 +76,22 @@ their own.
 - missing title, description, Open Graph tags, rel=canonical or meta viewport
 - invalid JSON-LD
 - a temporary (non-301/308) host redirect
-- no `robots.txt` at all (404): crawlers treat it as allow-all, but it should name the sitemap
+- `robots.txt` answering another 4xx (404, 410, 401, 403): crawlers treat that as allow-all,
+  but it should exist and name the sitemap
 - valid `robots.txt` or sitemap XML served with an HTML content type
 - robots naming no sitemap, or not naming the declared one
 - an AI search crawler blocked (`OAI-SearchBot`, `PerplexityBot`, `Claude-SearchBot`, …)
 - an empty sitemap
 - an edge bot challenge
 - `served-content-empty`: the homepage or a sampled page serves fewer than 50 words and no `<h1>`
-  without JavaScript (`<script>`, `<style>`, `<noscript>`, `<template>` and `<svg>` do not count).
-  Google renders JavaScript; most AI-search crawlers do not, so a client-rendered page is empty to
-  them. Prerender it. A short page under a server-rendered `<h1>`, such as a form, passes. This is
-  a warning while the eight sites it flags today are remediated
-- `soft-404` (production): a URL that does not exist answers 200
-- `sitemap-url-fragment`: sitemap URLs with a `#fragment` (crawlers drop it, so each duplicates the
-  page without it); they are not sampled
-- `robots-redirect-loop`, `robots-redirect-invalid`: `robots.txt` redirects more than five times or
-  to an unusable URL; crawlers then treat it as missing
+  without JavaScript. `<noscript>` content counts, because a crawler without JavaScript reads it;
+  `<script>`, `<style>`, `<template>` and `<svg>` do not, and inline markup does not split words.
+  Google renders JavaScript, but most AI-search crawlers do not, so a client-rendered page is empty
+  to them. Prerender it. A short page under a server-rendered `<h1>`, such as a form, passes. This
+  stays a warning while the sites it flags today are remediated.
+- `soft-404` (production): a URL that does not exist answers 200.
+- `sitemap-url-fragment`: sitemap URLs with a `#fragment`. Crawlers drop the fragment, so each one
+  duplicates the page without it, and they are not sampled.
 
 **Info:** no structured data; which training crawlers (`GPTBot`, `Google-Extended`, `CCBot`, …)
 are blocked. Blocking those is a legitimate choice for each client.
@@ -100,22 +102,30 @@ Set `indexnow-key` to tell IndexNow (Bing, Yandex, Seznam, Naver and others) whi
 The site must serve the key at `https://<host>/<key>.txt`. The key is public by design and is not
 a credential. Give the job `actions: read` as well as `checks: read`.
 
-- **When:** only on a push to the default branch, and only after the deploy check succeeded for
-  that commit. A failed or skipped deploy submits nothing. Pull requests and previews never submit.
-- **What:** only eligible URLs from the sitemap. An eligible URL is on the production host over
-  https, has no `#fragment`, is allowed for Bingbot, answers 200, is not `noindex` for Bingbot, and
-  names itself (or nothing) as canonical. Preview, staging, private and noindex routes are excluded
-  by construction.
+- **When:** only on a push to the default branch, and only after this invocation's deploy check
+  succeeded for that commit (a step output, never a shared file). A failed or skipped deploy
+  submits nothing. Pull requests and previews never submit.
+- **What:** only eligible sitemap URLs. An eligible URL is on the production origin (scheme, host
+  and port), has no `#fragment`, is allowed for Bingbot, answers 200, is not `noindex`, and names
+  exactly itself as canonical. The canonical is required, and is resolved against `<base href>`.
 - **Changed only:** each URL gets a fingerprint of what a reader sees (title, description,
-  canonical, visible text, JSON-LD). A URL is submitted only when its fingerprint differs from the
-  one IndexNow last accepted. A rebuild that changes only markup or asset hashes submits nothing.
-  The first run records a baseline and submits nothing.
-- **Limits and retries:** at most 10,000 URLs per request and 1,000 pages per run. A 429 or 5xx
-  is retried with backoff, honouring `Retry-After`. A refused change is retried on the next deploys,
-  at most 5 times, until the page changes again.
+  canonical, served text with inline markup ignored, JSON-LD in canonical form). A URL is submitted
+  only when its fingerprint differs from the one IndexNow last accepted.
+  - A markup-only or asset-hash rebuild submits nothing.
+  - No URL is submitted until one run has completed a baseline. A run where the key, robots.txt or
+    the site could not be read records nothing as accepted.
+  - A URL missing for a while keeps its accepted fingerprint, so its return unchanged is not a
+    change. It is forgotten after 365 days unseen.
+- **Limits and retries:**
+  - At most 10,000 URLs per request and 1,000 pages per run.
+  - 429 and 5xx are retried with backoff, honouring `Retry-After` in seconds or as an HTTP-date.
+    When the server asks for more than 60 seconds, the run does not retry early: it records the
+    time and later runs defer until then.
+  - A refused change is retried at most 5 times, until the page changes again.
 - **Records:** the ledger (fingerprints plus the last 200 submissions, with status codes and notes)
-  is kept as the `seo-standard-indexnow-ledger` artifact for 90 days. Each run reads the newest one.
-  A ledger that expired means the next run records a new baseline. The job summary shows each run.
+  is kept as the `seo-standard-indexnow-ledger` artifact for 90 days. Only artifacts from this
+  repository's default-branch runs are read; never a fork's or another branch's. An invalid ledger
+  starts a new baseline, and the reason is recorded. The job summary shows each run.
 - **Not proof of indexing:** "accepted" means IndexNow received the URLs, nothing more. Coverage
   comes from Search Console and Bing Webmaster Tools.
 

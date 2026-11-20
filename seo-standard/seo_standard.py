@@ -22,10 +22,12 @@ glencoe-infra's Search Console monitor.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime
+import email.utils
 import hashlib
-import html.parser
 import io
+import html.parser
 import json
 import os
 import re
@@ -41,7 +43,32 @@ USER_AGENT = "Mozilla/5.0 (compatible; Glencoe-SEO-Standard/1.0; +https://glenco
 SM = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
 RETRY_STATUS = {429, 500, 502, 503, 504}
 REDIRECTS = (301, 302, 303, 307, 308)
-SAMPLE_URLS = 5
+# Sitemap URLs fetched per audit, spread evenly across the whole sitemap (first and last always
+# included). A preview is fetched over the network on every pull request, so it samples fewer.
+SAMPLE_URLS = {"production": 20, "artifact": 20, "preview": 5}
+# Served content: what a crawler that does not run JavaScript reads. Most AI-search crawlers do
+# not run it, so a client-rendered page (a shell with a handful of words and no <h1>) is empty to
+# them even when Google renders it. 50 words separates a shell from a real page without judging
+# length; a short page under a server-rendered <h1> (a form) passes.
+SERVED_WORDS = 50
+# Not served text. <noscript> is: a crawler that does not run JavaScript reads it.
+HIDDEN_ELEMENTS = {"script", "style", "template", "svg"}
+# Elements that separate words; inline elements (<span>, <a>, <b>) do not, so "wo<span>rd</span>"
+# is one word, as a reader sees it.
+BLOCK_ELEMENTS = {"address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "fieldset",
+                  "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr",
+                  "li", "main", "nav", "ol", "p", "pre", "section", "table", "td", "th", "tr", "ul", "body"}
+HEAD_ELEMENTS = {"head", "title", "meta", "link", "script", "style", "base", "noscript", "template"}
+SOFT_404_PATH = "/glencoe-seo-standard-missing-page-probe"
+MAX_RETRY_WAIT = 60          # seconds; a longer Retry-After is honoured by not retrying in this run
+INDEXNOW_ENDPOINT = "https://api.indexnow.org/indexnow"
+INDEXNOW_BATCH = 10_000      # the protocol's limit per request
+INDEXNOW_PAGES = 1_000       # sitemap URLs fetched and fingerprinted per run
+INDEXNOW_ATTEMPTS = 5        # runs a refused change is retried before it waits for the next change
+INDEXNOW_ACCEPTED = (200, 202)
+INDEXNOW_FORGET_DAYS = 365   # a URL not seen for this long leaves the ledger
+LEDGER_LOG = 200             # submission records kept in the ledger
+LEDGER_ARTIFACT = "seo-standard-indexnow-ledger"
 CHILD_SITEMAPS = 10
 # Crawlers that put a site in search results, classic or AI. Blocking one hides the site from it.
 SEARCH_CRAWLERS = ("googlebot", "bingbot")
@@ -51,23 +78,6 @@ AI_SEARCH_CRAWLERS = ("oai-searchbot", "chatgpt-user", "perplexitybot", "perplex
 TRAINING_CRAWLERS = ("gptbot", "google-extended", "ccbot", "claudebot", "applebot-extended", "bytespider")
 # Robots directives that themselves contain a colon, so `name: value` is not a crawler scope.
 COLON_DIRECTIVES = {"unavailable_after", "max-snippet", "max-image-preview", "max-video-preview"}
-# Served content: what a crawler that does not run JavaScript reads. Most AI-search crawlers do
-# not run it, so a client-rendered page (a shell with a handful of words and no <h1>) is empty to
-# them even when Google renders it. 50 words separates a shell from a real page without judging
-# length; a short page under a server-rendered <h1> (a form) passes.
-SERVED_WORDS = 50
-HIDDEN_ELEMENTS = {"script", "style", "noscript", "template", "svg"}
-HEAD_ELEMENTS = {"head", "title", "meta", "link", "script", "style", "base", "noscript", "template"}
-SOFT_404_PATH = "/glencoe-seo-standard-missing-page-probe"
-ROBOTS_REDIRECTS = 5  # RFC 9309 2.3.1.2: follow at least five consecutive redirects
-INDEXNOW_ENDPOINT = "https://api.indexnow.org/indexnow"
-INDEXNOW_BATCH = 10_000      # the protocol's limit per request
-INDEXNOW_PAGES = 1_000       # sitemap URLs fetched and fingerprinted per run
-INDEXNOW_ATTEMPTS = 5        # runs a refused change is retried before it waits for the next change
-INDEXNOW_ACCEPTED = (200, 202)
-LEDGER_LOG = 200             # submission records kept in the ledger
-LEDGER_ARTIFACT = "seo-standard-indexnow-ledger"
-UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
 
 class Unauditable(Exception):
@@ -113,6 +123,21 @@ def _send(req: urllib.request.Request, timeout: float) -> Response:  # pragma: n
         return Response(e.code, headers_of(e.headers.items()), e.read(5_000_000), req.full_url)
 
 
+def retry_after(resp: "Response", now: datetime.datetime | None = None) -> float | None:
+    """Seconds the server asked us to wait (RFC 9110: delay-seconds or an HTTP-date), or None."""
+    value = resp.header("retry-after").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return float(value)
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return max((when - now).total_seconds(), 0.0)
+
+
 class Http:
     """HTTP with bounded retries (429 and 5xx, network errors). `send` and `sleep` are injectable."""
 
@@ -126,7 +151,7 @@ class Http:
         wait = 0.0
         for n in range(self.attempts):
             if n:
-                self.sleep(min(max(2 ** n, wait), 60))
+                self.sleep(min(max(2 ** n, wait), MAX_RETRY_WAIT))
             try:
                 resp = self.send(urllib.request.Request(url, data=body, headers=hdrs, method=method), self.timeout)
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
@@ -134,8 +159,10 @@ class Http:
                 continue
             if resp.status not in RETRY_STATUS:
                 return resp
-            retry_after = resp.header("retry-after").strip()
-            wait = float(retry_after) if retry_after.isdigit() else 0.0
+            asked = retry_after(resp)
+            if asked is not None and asked > MAX_RETRY_WAIT:
+                return resp  # retrying sooner than the server asked would ignore it; the caller defers
+            wait = asked or 0.0
             last = None
         if resp is None:
             raise ConnectionError(f"{method} {url}: {last}")
@@ -162,14 +189,17 @@ class Page(html.parser.HTMLParser):
 
     def __init__(self, text: str):
         super().__init__(convert_charrefs=True)
-        self.title, self.canonical, self.robots, self.viewport = "", "", "", False
+        self.title, self.canonical, self.robots, self.viewport, self.base = "", "", "", False, ""
         self.meta: dict[str, str] = {}
         self.jsonld: list[str] = []
-        self.words = self.h1 = 0
-        self.text: list[str] = []
+        self.h1 = 0
         self._in_title = self._in_ld = self._in_head = False
         self._hidden = 0
+        self._chunks: list[str] = []
         self.feed(text)
+        self.close()
+        self.text = " ".join("".join(self._chunks).split())  # the served text, as a reader sees it
+        self.words = len(self.text.split())
 
     def handle_starttag(self, tag, attrs):
         a = {k.lower(): (v or "") for k, v in attrs}
@@ -181,8 +211,12 @@ class Page(html.parser.HTMLParser):
             self._hidden += 1
         elif tag == "h1" and not self._hidden:
             self.h1 += 1
+        if tag in BLOCK_ELEMENTS:
+            self._chunks.append(" ")
         if tag == "title":
             self._in_title = True
+        elif tag == "base" and a.get("href") and not self.base:
+            self.base = a["href"]
         elif tag == "link" and "canonical" in a.get("rel", "").lower().split():
             self.canonical = self.canonical or a.get("href", "")
         elif tag == "meta":
@@ -202,6 +236,8 @@ class Page(html.parser.HTMLParser):
             self._in_head = False
         if tag in HIDDEN_ELEMENTS and self._hidden:
             self._hidden -= 1
+        if tag in BLOCK_ELEMENTS:
+            self._chunks.append(" ")
         if tag == "title":
             self._in_title = False
         elif tag == "script":
@@ -212,15 +248,16 @@ class Page(html.parser.HTMLParser):
             self.title += data
         elif self._in_ld:
             self.jsonld[-1] += data
-        elif not self._hidden and data.strip():
-            self._in_head = False  # text cannot sit in <head>
-            self.words += len(data.split())
-            self.text.append(" ".join(data.split()))
+        elif not self._hidden:
+            if data.strip():
+                self._in_head = False  # text cannot sit in <head>
+            if not self._in_head:
+                self._chunks.append(data)
 
 
 def noindex(directives: str) -> bool:
-    """`noindex` or `none` among comma-separated meta robots directives."""
-    return any(d.strip() in ("noindex", "none") for d in directives.lower().split(","))
+    """`noindex` or `none` among meta robots directives (comma- or space-separated)."""
+    return any(d in ("noindex", "none") for d in re.split(r"[,\s]+", directives.lower()))
 
 
 def header_noindex(value: str, agents=SEARCH_CRAWLERS) -> bool:
@@ -272,39 +309,31 @@ def robots_groups(text: str) -> list[tuple[set[str], list[tuple[bool, str]]]]:
     return groups
 
 
+def _decode(target: str) -> str:
+    """A path for comparison: percent-escapes of unreserved characters decoded (RFC 9309 §2.2.2),
+    `%2F` and other reserved escapes kept, hex digits upper-cased."""
+    def one(m):
+        ch = chr(int(m.group(1), 16))
+        return ch if (ch.isalnum() and ch.isascii()) or ch in "-._~" else "%" + m.group(1).upper()
+    return re.sub(r"%([0-9A-Fa-f]{2})", one, target)
+
+
 def _pattern(path: str) -> re.Pattern:
     anchored = path.endswith("$")
-    body = re.escape(path[:-1] if anchored else path).replace(r"\*", ".*")
+    body = re.escape(_decode(path[:-1] if anchored else path)).replace(r"\*", ".*")
     return re.compile(body + ("$" if anchored else ""))
 
 
-def octets(path: str) -> str:
-    """RFC 9309 2.2.2: paths compare as octets. Non-ASCII is percent-encoded as UTF-8, an escaped
-    unreserved character is decoded, and any other escape keeps its meaning (upper-case hex)."""
-    out, i = [], 0
-    while i < len(path):
-        pair = path[i + 1:i + 3]
-        if path[i] == "%" and len(pair) == 2 and all(c in "0123456789abcdefABCDEF" for c in pair):
-            char = chr(int(pair, 16))
-            out.append(char if char in UNRESERVED else "%" + pair.upper())
-            i += 3
-            continue
-        out.append(path[i] if ord(path[i]) < 128 else "".join(f"%{b:02X}" for b in path[i].encode()))
-        i += 1
-    return "".join(out)
-
-
-def allowed(text: str, agent: str, path: str = "/") -> bool:
-    """Google's robots.txt evaluation (RFC 9309): the agent's own groups (else `*`), the longest
-    matching rule in octets wins, and Allow wins a tie. No matching rule: allowed. Rules and the
-    path are compared after percent-encoding normalisation, so /%70rivate is /private."""
+def allowed(text: str, agent: str, target: str = "/") -> bool:
+    """Google's robots.txt evaluation (RFC 9309): the agent's own groups if any exist, even with no
+    rules, else `*`; the longest matching rule wins and Allow wins a tie; no match is allowed.
+    `target` is the path with its query."""
     groups = robots_groups(text)
-    rules = [r for a, rs in groups if agent in a for r in rs] or \
-            [r for a, rs in groups if "*" in a for r in rs]
-    path = octets(path)
+    own = [rs for a, rs in groups if agent in a]
+    rules = [r for rs in (own or [rs for a, rs in groups if "*" in a]) for r in rs]
+    path = _decode(target)
     best: tuple[int, bool] | None = None
-    for allow, raw in rules:
-        pat = octets(raw)
+    for allow, pat in rules:
         if _pattern(pat).match(path):
             key = (len(pat), allow)
             if best is None or key > best:
@@ -321,6 +350,11 @@ def looks_html(body: bytes) -> bool:
     """The body is an HTML document (a framework's fallback page), judged by content, not MIME."""
     head = body.lstrip(b"\xef\xbb\xbf \t\r\n")[:1024].lower()
     return head.startswith((b"<!doctype html", b"<html")) or (b"<html" in head and b"<head" in head)
+
+
+def canonical_of(page: Page, url: str) -> str:
+    """The page's canonical as an absolute URL, resolved against its <base href> if it has one."""
+    return urllib.parse.urljoin(urllib.parse.urljoin(url, page.base), page.canonical)
 
 
 def finding(severity: str, code: str, detail: str) -> dict:
@@ -350,6 +384,17 @@ class Live:
     def get(self, production_url: str) -> Response:
         return self.http.get(self.url(production_url), self.headers)
 
+    def get_following(self, production_url: str, hops: int = 5) -> Response:
+        """GET following up to `hops` redirects (as crawlers do for robots.txt)."""
+        url = self.url(production_url)
+        r = self.http.get(url, self.headers)
+        for _ in range(hops):
+            if r.status not in REDIRECTS or not r.header("location"):
+                break
+            url = urllib.parse.urljoin(url, r.header("location"))
+            r = self.http.get(url, self.headers)
+        return r
+
 
 class Build:
     """Files read from a static build directory, served as a static host would."""
@@ -371,6 +416,8 @@ class Build:
                          else "text/plain")
                 return Response(200, {"content-type": ctype}, body, f)
         return Response(404, {}, b"", production_url)
+
+    get_following = get
 
 
 # --- the audit -----------------------------------------------------------------------------------
@@ -438,7 +485,7 @@ def _homepage(r: Response, canonical: str, mode: str, out: list[dict], facts: di
         out.append(finding("warn", "no-meta-description", "the homepage has no meta description"))
     if not page.canonical:
         out.append(finding("warn", "no-canonical", "the homepage declares no rel=canonical"))
-    elif norm(urllib.parse.urljoin(canonical, page.canonical)) != norm(canonical):
+    elif norm(canonical_of(page, canonical)) != norm(canonical):
         out.append(finding("critical", "canonical-mismatch",
                            f"rel=canonical is {page.canonical}, expected {canonical}"))
     missing = [k for k in ("og:title", "og:description", "og:image") if not page.meta.get(k)]
@@ -458,62 +505,18 @@ def _homepage(r: Response, canonical: str, mode: str, out: list[dict], facts: di
             out.append(finding("warn", "structured-data-invalid", "a JSON-LD block is not valid JSON"))
 
 
-def _fetch_robots(src, url: str, out: list[dict]) -> Response:
-    """robots.txt as a crawler gets it: up to five redirects, each Location resolved against the URL
-    that returned it and kept whole. More than five, or an unusable Location, means no robots.txt
-    (answered as 404); an unreachable target means robots.txt is unreadable (answered as 503)."""
-    r, current = src.get(url), url
-    for _ in range(ROBOTS_REDIRECTS):
-        if r.status not in REDIRECTS or not r.header("location"):
-            return r
-        location = r.header("location").splitlines()[0].strip()
-        try:
-            current = urllib.parse.urljoin(current, location)
-            parts = urllib.parse.urlsplit(current)
-            if parts.scheme not in ("http", "https") or not parts.hostname:
-                raise ValueError(current)
-            parts.port  # noqa: B018 - raises ValueError on an invalid port
-        except ValueError:
-            out.append(finding("warn", "robots-redirect-invalid", f"robots.txt redirects to {location!r}, not a usable URL"))
-            return Response(404, {}, b"", url)
-        try:
-            r = src.get(current)
-        except ConnectionError:
-            return Response(503, {}, b"", current)
-    if r.status in REDIRECTS:
-        out.append(finding("warn", "robots-redirect-loop", f"robots.txt redirects more than {ROBOTS_REDIRECTS} times"))
-        return Response(404, {}, b"", url)
-    return r
-
-
-def _served(page: "Page", url: str, out: list[dict]) -> None:
-    """One warning per page: the homepage is checked once even when the sitemap samples it too."""
-    seen = {f.get("url") for f in out if f["code"] == "served-content-empty"}
-    if page.words < SERVED_WORDS and not page.h1 and norm(url) not in seen:
-        out.append({**finding("warn", "served-content-empty",
-                              f"{url} serves {page.words} words and no <h1> without JavaScript; most AI-search "
-                              "crawlers do not run it and see an empty page. Prerender it."), "url": norm(url)})
-
-
-def _soft_404(src, canonical: str, out: list[dict]) -> None:
-    probe = f"https://{host(canonical)}{SOFT_404_PATH}"
-    try:
-        r = src.get(probe)
-    except ConnectionError:
-        return
-    if r.status == 200:
-        out.append(finding("warn", "soft-404", f"{probe} does not exist but answers 200; missing pages must return 404"))
-
-
 def _robots(r: Response, mode: str, out: list[dict], facts: dict) -> str:
     """The robots.txt text crawlers obey ('' when none: everything is allowed)."""
-    if r.status in (404, 410):
-        out.append(finding("warn", "robots-missing", f"robots.txt answered {r.status}: crawlers treat that as "
-                           "allow-all, but it should name the sitemap"))
+    if r.status == 429 or r.status >= 500 or r.status in REDIRECTS:
+        # 429 and 5xx: Google crawls nothing until it can read robots.txt. A redirect still
+        # unresolved after 5 hops counts as unreadable too.
+        out.append(finding("critical", "robots-unreadable", f"robots.txt answered {r.status}: crawlers "
+                           "treat that as disallow-all"))
         return ""
     if r.status != 200:
-        # Google treats an unreachable robots.txt (5xx) as disallow-all until it can read one.
-        out.append(finding("critical", "robots-unreadable", f"robots.txt answered {r.status}"))
+        # Any other 4xx (404, 410, 401, 403): crawlers treat it as allow-all.
+        out.append(finding("warn", "robots-missing", f"robots.txt answered {r.status}: crawlers treat that as "
+                           "allow-all, but it should name the sitemap"))
         return ""
     if looks_html(r.body):
         out.append(finding("critical", "robots-is-html", "robots.txt returns an HTML page"))
@@ -536,12 +539,40 @@ def _robots(r: Response, mode: str, out: list[dict], facts: dict) -> str:
     return text
 
 
+def spread(urls: list[str], n: int) -> list[str]:
+    """n URLs spread evenly over the list, first and last included (all of them when n or fewer)."""
+    if len(urls) <= n:
+        return list(urls)
+    return [urls[round(i * (len(urls) - 1) / (n - 1))] for i in range(n)]
+
+
+def _served(page: "Page", url: str, out: list[dict]) -> None:
+    """One warning per page: the homepage is checked once even when the sample includes it."""
+    seen = {f.get("url") for f in out if f["code"] == "served-content-empty"}
+    if page.words < SERVED_WORDS and not page.h1 and norm(url) not in seen:
+        out.append({**finding("warn", "served-content-empty",
+                              f"{url} serves {page.words} words and no <h1> without JavaScript; most AI-search "
+                              "crawlers do not run it and see an empty page. Prerender it."), "url": norm(url)})
+
+
+def _soft_404(src, canonical: str, out: list[dict]) -> None:
+    probe = f"https://{host(canonical)}{SOFT_404_PATH}"
+    try:
+        r = src.get(probe)
+    except ConnectionError:
+        return
+    if r.status == 200:
+        out.append(finding("warn", "soft-404", f"{probe} does not exist but answers 200; missing pages must return 404"))
+
+
 def _sampled(src, mode: str, robots: str, urls: list[str], out: list[dict]) -> None:
-    for u in urls[:SAMPLE_URLS]:
-        parts = urllib.parse.urlsplit(u)
-        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
-        if robots and mode != "preview" and not allowed(robots, "googlebot", path):
-            out.append(finding("critical", "sitemap-url-disallowed", f"{u} is listed but robots.txt disallows it"))
+    for u in spread(urls, SAMPLE_URLS[mode]):
+        p = urllib.parse.urlsplit(u)
+        target = (p.path or "/") + (f"?{p.query}" if p.query else "")
+        blocked_for = [a for a in SEARCH_CRAWLERS if robots and not allowed(robots, a, target)]
+        if blocked_for and mode != "preview":
+            out.append(finding("critical", "sitemap-url-disallowed",
+                               f"{u} is listed but robots.txt disallows it for {', '.join(blocked_for)}"))
         s = src.get(u)
         if s.status == 404 and mode == "artifact":
             out.append(finding("info", "sitemap-url-not-static", f"{u} is not a file in the build (rendered at runtime?)"))
@@ -552,7 +583,7 @@ def _sampled(src, mode: str, robots: str, urls: list[str], out: list[dict]) -> N
         page = Page(s.text())
         if mode != "preview" and (header_noindex(s.header("x-robots-tag")) or noindex(page.robots)):
             out.append(finding("critical", "sitemap-url-noindex", f"{u} is noindex but listed in the sitemap"))
-        if page.canonical and norm(urllib.parse.urljoin(u, page.canonical)) != norm(u):
+        if page.canonical and norm(canonical_of(page, u)) != norm(u):
             out.append(finding("critical", "sitemap-url-canonical-elsewhere",
                                f"{u} declares rel=canonical {page.canonical}: list only canonical URLs"))
         _served(page, u, out)
@@ -580,7 +611,7 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
                                    "Googlebot is allowed with URL Inspection"))
             return {"findings": out, "facts": facts}
         _homepage(r, canonical, mode, out, facts)
-        robots = _robots(_fetch_robots(src, f"https://{host(canonical)}/robots.txt", out), mode, out, facts)
+        robots = _robots(src.get_following(f"https://{host(canonical)}/robots.txt"), mode, out, facts)
         declared = facts.get("robots_sitemaps", [])
         for m in sitemaps:
             if declared and m not in declared:
@@ -618,23 +649,39 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
 
 # --- IndexNow: changed canonical URLs, after a production deploy --------------------------------
 
-def fingerprint(page: "Page") -> str:
-    """What a search engine would re-read: title, description, canonical, visible text, JSON-LD.
-    Markup, scripts and asset hashes do not count, so a rebuild that changes nothing a reader sees
-    changes nothing here."""
+def strict(url: str) -> str:
+    """A URL compared exactly as a crawler would: scheme and host case-insensitive, default port
+    dropped, any other port kept, empty path "/", query kept, fragment dropped."""
+    p = urllib.parse.urlsplit(url)
+    port = p.port
+    scheme = p.scheme.lower()
+    netloc = (p.hostname or "").lower() + ("" if port in (None, {"https": 443, "http": 80}.get(scheme)) else f":{port}")
+    return urllib.parse.urlunsplit((scheme, netloc, p.path or "/", p.query, ""))
+
+
+def fingerprint(page: "Page", url: str) -> str:
+    """What a search engine would re-read: title, description, resolved canonical, the served text
+    as a reader sees it, and JSON-LD in canonical form. Markup, scripts and asset hashes do not
+    count, so a rebuild that changes nothing a reader sees changes nothing here."""
+    blocks = []
+    for b in page.jsonld:
+        try:
+            blocks.append(json.dumps(json.loads(b), sort_keys=True, separators=(",", ":")))
+        except ValueError:
+            blocks.append(" ".join(b.split()))
     h = hashlib.sha256()
-    for part in (page.title.strip(), page.meta.get("description", "").strip(), page.canonical.strip(),
-                 " ".join(page.text), *[b.strip() for b in page.jsonld]):
+    for part in (" ".join(page.title.split()), " ".join(page.meta.get("description", "").split()),
+                 canonical_of(page, url) if page.canonical else "", page.text, *blocks):
         h.update(part.encode("utf-8") + b"\0")
     return h.hexdigest()
 
 
-def eligible(http: Http, canonical: str, sitemaps: list[str], notes: list[str]) -> dict[str, str] | None:
+def eligible(http: "Http", canonical: str, sitemaps: list[str], notes: list[str]) -> dict[str, str] | None:
     """{url: fingerprint} for every sitemap URL a search engine should index: on the production
-    host over https, no #fragment, allowed for Bingbot, answering 200, not noindex, and naming
-    itself (or nothing) as canonical. None when robots.txt cannot be read (submit nothing)."""
+    origin (scheme, host and port), no #fragment, allowed for Bingbot, answering 200, not noindex,
+    and naming exactly itself as canonical. None when robots.txt cannot be read: submit nothing."""
     src = Live(http, canonical)
-    rr = _fetch_robots(src, f"https://{host(canonical)}/robots.txt", [])
+    rr = src.get_following(f"https://{host(canonical)}/robots.txt")
     if rr.status in (404, 410):
         robots = ""
     elif rr.status != 200 or looks_html(rr.body):
@@ -645,15 +692,17 @@ def eligible(http: Http, canonical: str, sitemaps: list[str], notes: list[str]) 
     urls: list[str] = []
     for m in sitemaps:
         urls += read_sitemap(src, m, [])
+    origin = urllib.parse.urlsplit(strict(canonical))[:2]
     pages: dict[str, str] = {}
     for u in dict.fromkeys(urls):
         if len(pages) >= INDEXNOW_PAGES:
-            notes.append(f"only the first {INDEXNOW_PAGES} eligible URLs were fingerprinted")
+            notes.append(f"only the first {INDEXNOW_PAGES} eligible URLs were fingerprinted; the rest keep their records")
             break
-        parts = urllib.parse.urlsplit(u)
-        if parts.scheme != "https" or host(u) != host(canonical) or parts.fragment:
+        try:
+            p = urllib.parse.urlsplit(strict(u))
+        except ValueError:
             continue
-        if not allowed(robots, "bingbot", (parts.path or "/") + (f"?{parts.query}" if parts.query else "")):
+        if p[:2] != origin or "#" in u or not allowed(robots, "bingbot", (p.path or "/") + (f"?{p.query}" if p.query else "")):
             continue
         r = src.get(u)
         if r.status != 200:
@@ -661,24 +710,50 @@ def eligible(http: Http, canonical: str, sitemaps: list[str], notes: list[str]) 
         page = Page(r.text())
         if header_noindex(r.header("x-robots-tag"), ("bingbot",)) or noindex(page.robots):
             continue
-        if page.canonical and norm(urllib.parse.urljoin(u, page.canonical)) != norm(u):
-            continue
-        pages[u] = fingerprint(page)
+        try:
+            self_canonical = bool(page.canonical) and strict(canonical_of(page, u)) == strict(u)
+        except ValueError:
+            self_canonical = False
+        if self_canonical:
+            pages[u] = fingerprint(page, u)
     return pages
 
 
-def indexnow(canonical: str, sitemaps: list[str], key: str, ledger: dict | None, http: Http,
+def _valid_ledger(ledger, h: str) -> tuple[dict | None, str]:
+    """(the ledger, '') when it is a well-formed version-1 ledger for this host, else (None, why)."""
+    if ledger is None:
+        return None, ""
+    entry_ok = lambda e: (isinstance(e, dict) and isinstance(e.get("fingerprint"), str)  # noqa: E731
+                          and isinstance(e.get("accepted"), str) and isinstance(e.get("attempts"), int))
+    if not (isinstance(ledger, dict) and ledger.get("version") == 1 and ledger.get("host") == h
+            and isinstance(ledger.get("urls"), dict) and isinstance(ledger.get("log"), list)
+            and isinstance(ledger.get("initialized"), bool) and isinstance(ledger.get("retry_after", ""), str)
+            and all(isinstance(u, str) and entry_ok(e) for u, e in ledger["urls"].items())):
+        return None, "the previous ledger is not a valid version-1 ledger for this host: starting a new baseline"
+    return ledger, ""
+
+
+def _when(text: str) -> datetime.datetime:
+    return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+
+
+def indexnow(canonical: str, sitemaps: list[str], key: str, ledger, http: "Http",
              sha: str = "", now: str | None = None, dry_run: bool = False) -> tuple[dict, dict]:
     """(new ledger, this run's record). Submits only eligible URLs whose fingerprint differs from
-    the one IndexNow last accepted. With no ledger, the run records a baseline and submits nothing:
-    a first run never re-announces a whole site. 'accepted' means IndexNow took the URLs; it is
-    never proof that anything was crawled or indexed."""
+    the one IndexNow last accepted. Until a run has recorded a baseline, nothing is submitted, so a
+    first run never re-announces a whole site. A URL missing for a while keeps its accepted
+    fingerprint, so its return unchanged is not a change. 'accepted' means IndexNow took the URLs;
+    it is never proof that anything was crawled or indexed."""
     now = now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     h = host(canonical)
     record: dict = {"time": now, "sha": sha, "host": h, "submitted": 0, "accepted": 0, "failed": 0,
                     "status": [], "notes": [], "dry_run": dry_run}
-    old = ledger if ledger and ledger.get("version") == 1 and ledger.get("host") == h else None
-    new = {"version": 1, "host": h, "urls": dict((old or {}).get("urls", {})), "log": list((old or {}).get("log", []))}
+    valid, why = _valid_ledger(ledger, h)
+    if why:
+        record["notes"].append(why)
+    new = copy.deepcopy(valid) if valid else {"version": 1, "host": h, "initialized": False, "retry_after": "",
+                                              "urls": {}, "log": []}
+    new.setdefault("retry_after", "")
 
     def done() -> tuple[dict, dict]:
         new["log"] = (new["log"] + [record])[-LEDGER_LOG:]
@@ -691,61 +766,80 @@ def indexnow(canonical: str, sitemaps: list[str], key: str, ledger: dict | None,
     pages = eligible(http, canonical, sitemaps, record["notes"])
     if pages is None:
         return done()
-    for u in [u for u in new["urls"] if u not in pages]:
-        del new["urls"][u]  # no longer eligible: forget it, so a return counts as a change
-    if old is None:
-        new["urls"] = {u: {"fingerprint": fp, "accepted": fp, "attempts": 0} for u, fp in pages.items()}
-        record["notes"].append(f"baseline: {len(pages)} eligible URLs recorded, nothing submitted")
-        return done()
-    changed = []
+    for u, entry in new["urls"].items():
+        entry["eligible"] = u in pages
     for u, fp in pages.items():
         entry = new["urls"].setdefault(u, {"fingerprint": fp, "accepted": "", "attempts": 0})
         if entry["fingerprint"] != fp:
             entry["fingerprint"], entry["attempts"] = fp, 0
-        if entry["accepted"] != fp and entry["attempts"] < INDEXNOW_ATTEMPTS:
-            changed.append(u)
+        entry["eligible"], entry["seen"] = True, now
+    cutoff = _when(now) - datetime.timedelta(days=INDEXNOW_FORGET_DAYS)
+    for u in [u for u, e in new["urls"].items() if "seen" in e and _when(e["seen"]) < cutoff]:
+        del new["urls"][u]
+    if not new["initialized"]:
+        for u in pages:
+            new["urls"][u]["accepted"] = new["urls"][u]["fingerprint"]
+        new["initialized"] = True
+        record["notes"].append(f"baseline: {len(pages)} eligible URLs recorded, nothing submitted")
+        return done()
+    changed = [u for u in pages if new["urls"][u]["accepted"] != new["urls"][u]["fingerprint"]
+               and new["urls"][u]["attempts"] < INDEXNOW_ATTEMPTS]
+    if not changed:
+        record["notes"].append("no eligible URL changed since IndexNow last accepted it")
+        return done()
+    if new["retry_after"] and _when(now) < _when(new["retry_after"]):
+        record["notes"].append(f"deferred: IndexNow asked to wait until {new['retry_after']}; {len(changed)} changed URLs kept for the next run")
+        return done()
     if dry_run:
         record["notes"].append(f"dry run: {len(changed)} changed URLs would be submitted")
         record["would_submit"] = changed
         return done()
+    new["retry_after"] = ""
     for i in range(0, len(changed), INDEXNOW_BATCH):
         batch = changed[i:i + INDEXNOW_BATCH]
         body = json.dumps({"host": h, "key": key, "keyLocation": f"https://{h}/{key}.txt", "urlList": batch}).encode()
         try:
             r = http.request("POST", INDEXNOW_ENDPOINT, {"Content-Type": "application/json; charset=utf-8"}, body)
-            status = r.status
         except ConnectionError:
-            status = 0
+            r = Response(0, {}, b"", INDEXNOW_ENDPOINT)
         record["submitted"] += len(batch)
-        record["status"].append(status)
+        record["status"].append(r.status)
+        accepted = r.status in INDEXNOW_ACCEPTED
         for u in batch:
             entry = new["urls"][u]
-            if status in INDEXNOW_ACCEPTED:
+            if accepted:
                 entry["accepted"], entry["attempts"], entry["accepted_at"] = entry["fingerprint"], 0, now
             else:
                 entry["attempts"] += 1
-        if status in INDEXNOW_ACCEPTED:
-            record["accepted"] += len(batch)
-        else:
-            record["failed"] += len(batch)
-    if not changed:
-        record["notes"].append("no eligible URL changed since IndexNow last accepted it")
+        record["accepted" if accepted else "failed"] += len(batch)
+        asked = retry_after(r, _when(now))
+        if not accepted and asked:
+            new["retry_after"] = (_when(now) + datetime.timedelta(seconds=asked)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            record["notes"].append(f"IndexNow answered {r.status} and asked to wait until {new['retry_after']}; the rest wait too")
+            break
     return done()
 
 
-def fetch_ledger(http: Http, repo: str, token: str) -> dict | None:
-    """The newest unexpired ledger artifact from this repository's earlier runs, or None."""
+def fetch_ledger(http: "Http", repo: str, token: str, branch: str) -> dict | None:
+    """The newest unexpired ledger artifact that a run of this repository's default branch made
+    (never a fork's or another branch's), or None."""
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={LEDGER_ARTIFACT}&per_page=20", hdrs)
+    r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={LEDGER_ARTIFACT}&per_page=100", hdrs)
     if r.status != 200:
         return None
-    live = [a for a in json.loads(r.body).get("artifacts", []) if not a.get("expired")]
-    if not live:
+    try:
+        listing = json.loads(r.body).get("artifacts", [])
+    except (ValueError, AttributeError):
         return None
-    newest = max(live, key=lambda a: a.get("created_at", ""))
-    z = http.get(newest["archive_download_url"], hdrs)
+    own = [a for a in listing if isinstance(a, dict) and not a.get("expired")
+           and (a.get("workflow_run") or {}).get("head_branch") == branch
+           and (a.get("workflow_run") or {}).get("head_repository_id") == (a.get("workflow_run") or {}).get("repository_id")]
+    if not own:
+        return None
+    newest = max(own, key=lambda a: str(a.get("created_at", "")))
+    z = http.get(newest.get("archive_download_url", ""), hdrs)
     while z.status in REDIRECTS and z.header("location"):
-        z = http.get(z.header("location"))  # the archive itself is served from signed storage
+        z = http.get(z.header("location"))  # signed storage: the GitHub token is never sent there
     if z.status != 200:
         return None
     try:
@@ -792,7 +886,8 @@ def latest_run(http: Http, url: str, hdrs: dict) -> dict | None:
         runs += json.loads(r.body).get("check_runs", [])
         m = NEXT_LINK.search(r.header("link"))
         url = m.group(1) if m else ""
-    return max(runs, key=lambda c: (c.get("started_at") or "", c.get("id") or 0), default=None)
+    # Ids grow with creation, so the highest id is the newest run, queued or not.
+    return max(runs, key=lambda c: c.get("id") or 0, default=None)
 
 
 def wait_for_check(http: Http, repo: str, sha: str, name: str, token: str, timeout: float = 900,
@@ -803,6 +898,7 @@ def wait_for_check(http: Http, repo: str, sha: str, name: str, token: str, timeo
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     deadline = clock() + timeout
     while True:
+        http.timeout = max(1.0, min(http.timeout, deadline - clock()))
         try:
             run = latest_run(http, url, hdrs)
         except ConnectionError as e:
@@ -865,6 +961,7 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
     n.add_argument("--ledger-out", required=True, help="write the new ledger here")
     n.add_argument("--ledger-in", help="the previous ledger (JSON); omit to fetch it from this repo's artifacts")
     n.add_argument("--repo", default="", help="owner/name, to fetch the previous ledger artifact")
+    n.add_argument("--branch", default="", help="the default branch whose runs made the ledger")
     n.add_argument("--sha", default="")
     n.add_argument("--md", help="append the record as markdown here")
     n.add_argument("--dry-run", action="store_true")
@@ -873,18 +970,19 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
 
     if args.command == "indexnow":
         if not args.canonical.startswith("https://") or not args.sitemap or \
-                not re.fullmatch(r"[A-Za-z0-9-]{8,128}", args.key):
-            print("indexnow: needs an https --canonical, a --sitemap and an 8-128 character [A-Za-z0-9-] --key",
-                  file=sys.stderr)
+                not re.fullmatch(r"[A-Za-z0-9-]{8,128}", args.key) or (args.repo and not args.branch):
+            print("indexnow: needs an https --canonical, a --sitemap, an 8-128 character [A-Za-z0-9-] --key, "
+                  "and --branch with --repo", file=sys.stderr)
             return 2
+        ledger = None
         if args.ledger_in:
             try:
                 with open(args.ledger_in, encoding="utf-8") as f:
                     ledger = json.load(f)
             except (OSError, ValueError):
-                ledger = None
-        else:
-            ledger = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", "")) if args.repo else None
+                ledger = "unreadable"
+        elif args.repo:
+            ledger = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", ""), args.branch)
         try:
             new, record = indexnow(args.canonical, args.sitemap, args.key, ledger, http, args.sha, dry_run=args.dry_run)
         except ConnectionError as e:

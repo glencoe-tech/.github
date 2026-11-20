@@ -4,6 +4,7 @@ wildcards, crawler-scoped X-Robots-Tag, MIME-only HTML detection, sampled-page c
 sitemap origins, unreachable sites exiting 2).
 Run: python3 -I -m unittest discover -s seo-standard/tests -v
 """
+import datetime
 import io
 import json
 import os
@@ -155,6 +156,11 @@ class Production(unittest.TestCase):
         t[("GET", "https://example.com/")] = R(200, HOME, x_robots_tag="unavailable_after: 2030-01-01, googlebot: none")
         self.assertIn("homepage-noindex-header", codes(run(t), "critical"))
 
+    def test_a_canonical_resolves_against_the_documents_base(self):
+        t = live()
+        t[("GET", "https://example.com/a")] = R(200, page("a", b'<base href="/">'))
+        self.assertEqual(loud(run(t)), [])
+
     def test_a_relative_canonical_resolves_against_the_production_url(self):
         t = live()
         t[("GET", "https://example.com/")] = R(200, page("/"))
@@ -166,10 +172,23 @@ class Production(unittest.TestCase):
         result = run(t)
         self.assertIn("robots-missing", codes(result, "warn"), "a missing robots.txt allows crawling")
         self.assertEqual(codes(result, "critical"), set())
-        t[("GET", "https://example.com/robots.txt")] = R(403)
-        self.assertIn("robots-unreadable", codes(run(t), "critical"))
+        for status in (401, 403):
+            t[("GET", "https://example.com/robots.txt")] = R(status)
+            self.assertEqual((codes(run(t), "critical"), "robots-missing" in codes(run(t), "warn")), (set(), True),
+                             f"{status}: crawlers treat a 4xx robots.txt as allow-all")
+        for status in (429, 503):
+            t[("GET", "https://example.com/robots.txt")] = R(status)
+            self.assertIn("robots-unreadable", codes(run(t), "critical"))
         t[("GET", "https://example.com/robots.txt")] = R(200, b"<!doctype html><html>", content_type="text/html")
         self.assertIn("robots-is-html", codes(run(t), "critical"))
+
+    def test_robots_redirects_are_followed(self):
+        t = live()
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="https://example.com/r/robots.txt")
+        t[("GET", "https://example.com/r/robots.txt")] = R(200, ROBOTS)
+        self.assertEqual(loud(run(t)), [])
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="/robots.txt")
+        self.assertIn("robots-unreadable", codes(run(t), "critical"), "a redirect loop never resolves")
 
     def test_robots_judged_by_content_not_mime(self):
         t = live()
@@ -188,6 +207,12 @@ class Production(unittest.TestCase):
         t = live()
         t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nDisallow: /a\n" + ROBOTS)
         self.assertIn("sitemap-url-disallowed", codes(run(t), "critical"))
+        t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: bingbot\nDisallow: /a\n\n" + ROBOTS)
+        self.assertEqual([f["detail"] for f in run(t)["findings"] if f["code"] == "sitemap-url-disallowed"],
+                         ["https://example.com/a is listed but robots.txt disallows it for bingbot"])
+        t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nDisallow: /\n\nUser-agent: googlebot\n"
+                                                         b"Disallow:\n\nUser-agent: bingbot\nDisallow:\n")
+        self.assertNotIn("robots-blocks-search", codes(run(t)), "a crawler's own empty group overrides *")
         t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nSitemap: https://example.com/o.xml\n")
         self.assertIn("sitemap-not-in-robots", codes(run(t), "warn"))
         t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nAllow: /\n")
@@ -356,9 +381,15 @@ class Parsing(unittest.TestCase):
         self.assertFalse(seo.allowed("User-agent: Googlebot # g\nUser-agent: Bingbot\nDisallow: /\n", "bingbot"))
         self.assertFalse(seo.allowed("User-agent: *\nDisallow: /*.pdf$\n", "googlebot", "/a.pdf"))
         self.assertTrue(seo.allowed("User-agent: *\nDisallow: /*.pdf$\n", "googlebot", "/a.pdf.html"))
+        self.assertTrue(seo.allowed("User-agent: *\nDisallow: /a\nAllow: /a?ok=1\n", "googlebot", "/a?ok=1"),
+                        "the query is part of what is matched")
+        self.assertFalse(seo.allowed("User-agent: *\nDisallow: /a\n", "googlebot", "/%61"), "%61 is a")
+        self.assertFalse(seo.allowed("User-agent: *\nDisallow: /%7Ex\n", "googlebot", "/~x"))
+        self.assertTrue(seo.allowed("User-agent: *\nDisallow: /a/b\n", "googlebot", "/a%2Fb"), "%2F stays reserved")
         self.assertEqual(seo.robots_sitemaps("sitemap: https://x/a.xml\n"), ["https://x/a.xml"])
 
     def test_page_and_helpers(self):
+        self.assertTrue(seo.noindex("noindex nofollow"))
         p = seo.Page('<meta name="googlebot" content="NONE"><link rel="alternate" href="x"><meta content="x">')
         self.assertTrue(seo.noindex(p.robots))
         self.assertEqual(p.canonical, "")
@@ -385,9 +416,8 @@ class Parsing(unittest.TestCase):
 
 
 class DiscoverabilityGaps(unittest.TestCase):
-    """The rules ported from the reviewed discoverability check (glencoe-tech/.github#28, closed as
-    superseded): served content, soft 404s, #fragment sitemap URLs, robots.txt redirects,
-    percent-encoded robots paths, and query strings in sampled robots paths."""
+    """Served content, soft 404s, #fragment sitemap URLs and even sitemap sampling, from the
+    reviewed discoverability check (glencoe-tech/.github#28, closed as superseded). All warnings."""
 
     SHELL = (b'<!doctype html><html><head><title>Shell</title><link rel="canonical" href="https://example.com/">'
              b'<meta name="description" content="d"></head><body><div id="root"></div>'
@@ -399,9 +429,9 @@ class DiscoverabilityGaps(unittest.TestCase):
         t[("GET", "https://example.com/")] = R(200, self.SHELL, content_type="text/html")
         result = run(t)
         shells = [f for f in result["findings"] if f["code"] == "served-content-empty"]
-        self.assertEqual([f["severity"] for f in shells], ["warn"])  # homepage once, though sampled too
-        self.assertEqual(result["facts"]["served_words"], 0)
-        self.assertEqual(codes(run(t), "critical"), set())
+        self.assertEqual([f["severity"] for f in shells], ["warn"])  # the homepage once, though sampled too
+        self.assertEqual(result["facts"]["served_words"], 13)  # the <noscript> notice is served text, still a shell
+        self.assertEqual(codes(result, "critical"), set())
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         with open(os.path.join(d, "index.html"), "wb") as fh:
@@ -415,8 +445,12 @@ class DiscoverabilityGaps(unittest.TestCase):
         unclosed = "<html><head><title>t</title><meta name=x content=y>" + " ".join(["w"] * 60)
         self.assertEqual(seo.Page(unclosed).words, 60)
         self.assertEqual(seo.Page("<head></head><body></noscript>a b</body>").words, 2)
+        self.assertEqual(seo.Page("<p>wo<span>rd</span> two</p><p>three</p>").text, "word two three")
+        self.assertEqual(seo.Page("<head>\n  <title>t</title>\n</head><body>x</body>").words, 1)  # head whitespace is not text
+        fallback = "<body><noscript><h1>Welcome</h1><p>Our site works without JavaScript.</p></noscript></body>"
+        self.assertEqual((seo.Page(fallback).h1, seo.Page(fallback).words), (1, 6))  # noscript is served text
         t = live()
-        t[("GET", "https://example.com/a")] = R(200, form.replace(b"Three short steps.", b"Short."), content_type="text/html")
+        t[("GET", "https://example.com/a")] = R(200, form, content_type="text/html")
         self.assertNotIn("served-content-empty", codes(run(t)))
 
     def test_soft_404(self):
@@ -428,219 +462,262 @@ class DiscoverabilityGaps(unittest.TestCase):
         self.assertNotIn("soft-404", codes(result))
         self.assertNotIn("unauditable", result)
 
-    def test_fragment_sitemap_urls(self):
+    def test_fragment_sitemap_urls_are_reported_and_not_sampled(self):
         t = live()
         t[("GET", SITEMAP)] = R(200, URLSET.replace(b"https://example.com/a<", b"https://example.com/#a<"), content_type="application/xml")
         result = run(t)
         self.assertIn("sitemap-url-fragment", codes(result, "warn"))
         self.assertEqual(codes(result, "critical"), set())
 
-    def test_robots_redirects(self):
+    def test_samples_spread_across_the_whole_sitemap(self):
+        urls = [f"u{i}" for i in range(100)]
+        picked = seo.spread(urls, 20)
+        self.assertEqual((len(picked), picked[0], picked[-1], len(set(picked))), (20, "u0", "u99", 20))
+        self.assertEqual(seo.spread(urls[:3], 20), urls[:3])
+        self.assertEqual(seo.SAMPLE_URLS["preview"], 5)
+        # silverbackmoving.ca's shape: the noindex page is URL 7 of 18, which a first-5 sample missed.
+        locs = [f"https://example.com/p{i}" for i in range(18)]
         t = live()
-        t[("GET", "https://example.com/robots.txt")] = R(301, location="/rules/start")
-        t[("GET", "https://example.com/rules/start")] = R(302, location="robots.txt")
-        t[("GET", "https://example.com/rules/robots.txt")] = R(200, b"User-agent: *\nDisallow: /\n", content_type="text/plain")
-        self.assertIn("robots-blocks-search", codes(run(t), "critical"))  # each hop resolves against the last
-        t[("GET", "https://example.com/robots.txt")] = R(301, location="/rules,production.txt")
-        t[("GET", "https://example.com/rules,production.txt")] = R(200, b"User-agent: *\nDisallow: /\n", content_type="text/plain")
-        self.assertIn("robots-blocks-search", codes(run(t), "critical"))  # a comma is part of the URL
-        for n in range(seo.ROBOTS_REDIRECTS):  # exactly five redirects still reach the rules
-            t[("GET", f"https://example.com/hop{n}")] = R(301, location=f"/hop{n + 1}")
-        t[("GET", "https://example.com/robots.txt")] = R(301, location="/hop1")
-        t[("GET", f"https://example.com/hop{seo.ROBOTS_REDIRECTS}")] = R(200, b"User-agent: *\nDisallow: /\n", content_type="text/plain")
-        self.assertIn("robots-blocks-search", codes(run(t), "critical"))
-        t[("GET", "https://example.com/robots.txt")] = R(302, location="/robots.txt")
-        loop = run(t)
-        self.assertTrue({"robots-redirect-loop", "robots-missing"} <= codes(loop, "warn"))
-        self.assertNotIn("robots-blocks-search", codes(loop))
-        for target in ("https://[invalid/robots.txt", "https://example.com:bad/r.txt", "mailto:x@example.com"):
-            t[("GET", "https://example.com/robots.txt")] = R(302, location=target)
-            self.assertIn("robots-redirect-invalid", codes(run(t), "warn"), target)
-        t[("GET", "https://example.com/robots.txt")] = R(301, location="https://gone.example.net/robots.txt")
-        self.assertIn("robots-unreadable", codes(run(t), "critical"))  # unreachable: treat as disallow-all
-
-    def test_percent_encoded_paths_and_queries(self):
-        rules = "User-agent: *\nDisallow: /private\nDisallow: /caf\u00e9\nDisallow: /a%2fb\nDisallow: /search?\n"
-        self.assertFalse(seo.allowed(rules, "googlebot", "/%70rivate"))
-        self.assertFalse(seo.allowed(rules, "googlebot", "/caf%c3%a9/menu"))
-        self.assertFalse(seo.allowed(rules, "googlebot", "/a%2Fb"))  # a reserved escape keeps its meaning
-        self.assertTrue(seo.allowed(rules, "googlebot", "/a/b"))
-        self.assertEqual(seo.octets("/%7euser/%zz"), "/~user/%zz")
-        # RFC 9309 2.2.2: the most specific rule has the most octets, so /* (2) beats / (1).
-        self.assertFalse(seo.allowed("User-agent: *\nAllow: /\nDisallow: /*\n", "googlebot", "/x"))
-        t = live()
-        t[("GET", "https://example.com/robots.txt")] = R(200, ROBOTS + b"Disallow: /search?\n", content_type="text/plain")
-        t[("GET", SITEMAP)] = R(200, URLSET.replace(b"https://example.com/a<", b"https://example.com/search?q=1<"), content_type="application/xml")
-        t[("GET", "https://example.com/search?q=1")] = R(200, page("https://example.com/search?q=1"), content_type="text/html")
-        self.assertIn("sitemap-url-disallowed", codes(run(t), "critical"))
+        t[("GET", SITEMAP)] = R(200, b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                                + b"".join(b"<url><loc>" + u.encode() + b"</loc></url>" for u in locs) + b"</urlset>",
+                                content_type="application/xml")
+        for i, u in enumerate(locs):
+            extra = b'<meta name="robots" content="noindex">' if i == 6 else b""
+            t[("GET", u)] = R(200, page(u, extra), content_type="text/html")
+        self.assertIn("sitemap-url-noindex", codes(run(t), "critical"))
 
 
 class IndexNow(unittest.TestCase):
-    """Only eligible canonical URLs whose content changed since IndexNow last accepted them, only
-    after a deploy, with a ledger that records every submission and refusal."""
+    """Only eligible, self-canonical URLs whose content changed since IndexNow last accepted them,
+    only after this invocation's deploy succeeded, with a ledger of every submission and refusal.
+    Includes the regressions from independent review of #31 at 1cfa394."""
 
     KEY = "0123456789abcdef"
     POST = ("POST", seo.INDEXNOW_ENDPOINT)
+    NOW = "2026-11-20T00:00:00Z"
 
-    def site(self, **extra):
+    def site(self):
         t = live()
         t[("GET", f"https://example.com/{self.KEY}.txt")] = R(200, self.KEY.encode() + b"\n", content_type="text/plain")
-        t.update(extra)
         return t
 
-    def go(self, table, ledger=None, **kw):
+    def go(self, table, ledger=None, now=None, **kw):
         h, fake = http(table)
-        new, record = seo.indexnow(CANON, [SITEMAP], self.KEY, ledger, h, "abc123", "2026-11-20T00:00:00Z", **kw)
+        new, record = seo.indexnow(CANON, [SITEMAP], self.KEY, ledger, h, "abc123", now or self.NOW, **kw)
         return new, record, [json.loads(b) for (k, _), b in zip(fake.calls, fake.bodies) if k == self.POST]
 
     def baseline(self, table=None):
         new, record, posts = self.go(table or self.site())
-        self.assertEqual(posts, [])
+        self.assertEqual((posts, new["initialized"]), ([], True))
         return new
 
-    def test_the_hosted_key_is_verified_first(self):
+    def change(self, t, url="https://example.com/a", word=b"changed"):
+        t[("GET", url)] = R(200, page(url).replace(b"word", word), content_type="text/html")
+
+    def test_the_deploy_gate_is_this_invocations_step_output(self):
+        with open(os.path.join(os.path.dirname(seo.__file__), "action.yml"), encoding="utf-8") as f:
+            action = f.read()
+        gate = next(line for line in action.splitlines() if "inputs.indexnow-key != ''" in line)
+        self.assertIn("steps.seo.outputs.deployed == 'true'", gate)
+        self.assertIn("github.event_name == 'push'", gate)
+        self.assertIn("refs/heads/{0}', github.event.repository.default_branch", gate)
+        wait, mark = action.index("--wait-only"), action.index('echo "deployed=true" >> "$GITHUB_OUTPUT"')
+        self.assertLess(wait, mark)  # written only after the wait returned successfully (set -e)
+        self.assertNotIn("seo-standard-deployed", action)  # no shared marker another invocation could leave
+
+    def test_the_hosted_key_is_verified_first_and_a_failed_first_run_is_not_a_baseline(self):
         t = self.site()
         t[("GET", f"https://example.com/{self.KEY}.txt")] = R(404)
         new, record, posts = self.go(t)
-        self.assertEqual((posts, record["submitted"]), ([], 0))
+        self.assertEqual((posts, new["initialized"]), ([], False))
         self.assertIn("without the key", record["notes"][0])
-        self.assertEqual(new["log"][-1]["sha"], "abc123")
+        t = self.site()
+        self.change(t)
+        t[self.POST] = R(200)
+        after, record, posts = self.go(t, new)
+        self.assertEqual(posts, [])  # the first successful run is the baseline, never a full submission
+        self.assertIn("baseline", record["notes"][-1])
 
     def test_unreadable_robots_submits_nothing(self):
         for status in (503, 200):
             t = self.site()
             t[("GET", "https://example.com/robots.txt")] = R(status, HOME if status == 200 else b"")
-            _, record, posts = self.go(t, {"version": 1, "host": "example.com", "urls": {}, "log": []})
-            self.assertEqual(posts, [])
+            new, record, posts = self.go(t)
+            self.assertEqual((posts, new["initialized"]), ([], False))
             self.assertIn("nothing is submitted", record["notes"][0])
 
-    def test_a_first_run_records_a_baseline_and_submits_nothing(self):
-        new = self.baseline()
-        self.assertEqual(sorted(new["urls"]), ["https://example.com/", "https://example.com/a"])
-        self.assertTrue(all(e["accepted"] == e["fingerprint"] for e in new["urls"].values()))
-        self.assertIn("baseline", new["log"][-1]["notes"][0])
+    def test_a_baseline_then_only_changed_urls_once(self):
+        ledger = self.baseline()
+        self.assertEqual(sorted(ledger["urls"]), ["https://example.com/", "https://example.com/a"])
         t = self.site()
         t[("GET", "https://example.com/robots.txt")] = R(404)  # no robots.txt: everything is allowed
-        self.assertEqual(len(self.baseline(t)["urls"]), 2)
-
-    def test_only_changed_urls_are_submitted_once(self):
-        ledger = self.baseline()
-        t = self.site()
-        t[("GET", "https://example.com/a")] = R(200, page("https://example.com/a", b"<meta name='description' content='new'>").replace(b"word", b"text"), content_type="text/html")
+        self.change(t)
         t[self.POST] = R(202)
         new, record, posts = self.go(t, ledger)
         self.assertEqual(posts, [{"host": "example.com", "key": self.KEY, "keyLocation": f"https://example.com/{self.KEY}.txt",
                                   "urlList": ["https://example.com/a"]}])
-        self.assertEqual((record["submitted"], record["accepted"], record["status"]), (1, 1, [202]))
-        self.assertEqual(new["urls"]["https://example.com/a"]["accepted_at"], "2026-11-20T00:00:00Z")
-        again, record2, posts2 = self.go(t, new)
-        self.assertEqual((posts2, record2["submitted"]), ([], 0))  # unchanged: never resubmitted
-        self.assertIn("no eligible URL changed", record2["notes"][0])
+        self.assertEqual((record["accepted"], new["urls"]["https://example.com/a"]["accepted_at"]), (1, self.NOW))
+        _, again, posts = self.go(t, new)
+        self.assertEqual(posts, [])
+        self.assertIn("no eligible URL changed", again["notes"][0])
 
-    def test_markup_only_rebuilds_are_not_changes(self):
+    def test_markup_and_formatting_only_rebuilds_are_not_changes(self):
         ledger = self.baseline()
         t = self.site()
-        t[("GET", "https://example.com/a")] = R(200, page("https://example.com/a").replace(b"<h1>", b"<script src='/x.9f3a.js'></script><h1 class='new'>"), content_type="text/html")
-        _, record, posts = self.go(t, ledger)
+        body = page("https://example.com/a").replace(b"word word", b"wo<span>rd</span> <b>word</b>", 1)
+        body = body.replace(b'{"@type": "Organization"}', b'{ "@type" : "Organization" }').replace(b"<h1>", b"<script src='/x.9f3a.js'></script><h1 class='v2'>")
+        t[("GET", "https://example.com/a")] = R(200, body, content_type="text/html")
+        _, _, posts = self.go(t, ledger)
         self.assertEqual(posts, [])
+        broken = seo.Page(page().replace(b'{"@type": "Organization"}', b'{ broken  json').decode())
+        spaced = seo.Page(page().replace(b'{"@type": "Organization"}', b'{   broken json ').decode())
+        self.assertEqual(seo.fingerprint(broken, CANON), seo.fingerprint(spaced, CANON))  # invalid JSON-LD: by its text
 
-    def test_ineligible_urls_are_never_submitted(self):
-        urls = ["https://example.com/", "https://other.example/x", "http://example.com/plain", "https://example.com/#frag",
-                "https://example.com/private", "https://example.com/gone", "https://example.com/hidden",
-                "https://example.com/scoped", "https://example.com/elsewhere", "https://example.com/googlebot-only"]
-        urlset = (b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-                  + b"".join(b"<url><loc>" + u.encode() + b"</loc></url>" for u in urls) + b"</urlset>")
-        t = self.site(**{})
-        t[("GET", SITEMAP)] = R(200, urlset, content_type="application/xml")
+    def test_only_eligible_self_canonical_urls_on_the_production_origin(self):
+        urls = ["https://example.com/", "https://other.example/x", "http://example.com/plain", "https://example.com:8443/port",
+                "https://example.com/#frag", "https://example.com/private", "https://example.com/gone", "https://example.com/hidden",
+                "https://example.com/scoped", "https://example.com/elsewhere", "https://example.com/portcanon",
+                "https://example.com/basecanon", "https://example.com/nocanon", "https://example.com/badcanon", "https://example.com:x/bad",
+                "https://example.com/googlebot-only"]
+        t = self.site()
+        t[("GET", SITEMAP)] = R(200, b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                                + b"".join(b"<url><loc>" + u.encode() + b"</loc></url>" for u in urls) + b"</urlset>",
+                                content_type="application/xml")
         t[("GET", "https://example.com/robots.txt")] = R(200, ROBOTS + b"User-agent: bingbot\nDisallow: /private\n", content_type="text/plain")
         t[("GET", "https://example.com/gone")] = R(404)
         t[("GET", "https://example.com/hidden")] = R(200, page("https://example.com/hidden", b'<meta name="robots" content="noindex">'))
         t[("GET", "https://example.com/scoped")] = R(200, page("https://example.com/scoped"), x_robots_tag="bingbot: noindex")
         t[("GET", "https://example.com/elsewhere")] = R(200, page("https://example.com/"))
+        t[("GET", "https://example.com/portcanon")] = R(200, page("https://example.com:8443/portcanon"))
+        t[("GET", "https://example.com/basecanon")] = R(200, page("/basecanon", b'<base href="https://other.example/">'))
+        t[("GET", "https://example.com/nocanon")] = R(200, page("").replace(b'<link rel="canonical" href="">', b""))
+        t[("GET", "https://example.com/badcanon")] = R(200, page("https://example.com:bad/badcanon"))
         t[("GET", "https://example.com/googlebot-only")] = R(200, page("https://example.com/googlebot-only"), x_robots_tag="googlebot: noindex")
         new = self.baseline(t)
         self.assertEqual(sorted(new["urls"]), ["https://example.com/", "https://example.com/googlebot-only"])
 
-    def test_refusals_are_recorded_retried_and_capped(self):
+    def test_a_url_missing_for_a_while_keeps_its_history(self):
         ledger = self.baseline()
         t = self.site()
-        t[("GET", "https://example.com/a")] = R(200, page("https://example.com/a").replace(b"word", b"changed"), content_type="text/html")
+        self.change(t)
+        t[self.POST] = R(200)
+        accepted, _, posts = self.go(t, ledger)
+        self.assertEqual(len(posts), 1)
+        gone = self.site()
+        gone[("GET", "https://example.com/a")] = R(404)
+        kept, _, _ = self.go(gone, accepted)
+        self.assertFalse(kept["urls"]["https://example.com/a"]["eligible"])
+        _, record, posts = self.go(t, kept)  # back, exactly as accepted: not a change
+        self.assertEqual(posts, [])
+        old = self.go(t, kept, now="2027-12-01T00:00:00Z")[0]
+        self.assertIn("https://example.com/", old["urls"])  # seen again on this run, so kept
+        stale = json.loads(json.dumps(kept))
+        stale["urls"]["https://example.com/a"]["seen"] = "2025-01-01T00:00:00Z"
+        forgotten, _, _ = self.go(gone, stale)
+        self.assertNotIn("https://example.com/a", forgotten["urls"])
+
+    def test_refusals_are_recorded_retried_and_capped(self):
+        state = self.baseline()
+        t = self.site()
+        self.change(t)
         t[self.POST] = R(422)
-        state = ledger
-        for n in range(seo.INDEXNOW_ATTEMPTS):
+        for _ in range(seo.INDEXNOW_ATTEMPTS):
             state, record, posts = self.go(t, state)
             self.assertEqual((len(posts), record["failed"], record["status"]), (1, 1, [422]))
-        self.assertEqual(state["urls"]["https://example.com/a"]["attempts"], seo.INDEXNOW_ATTEMPTS)
         state, record, posts = self.go(t, state)
         self.assertEqual(posts, [])  # capped until the page changes again
-        t[("GET", "https://example.com/a")] = R(200, page("https://example.com/a").replace(b"word", b"again"), content_type="text/html")
-        t[self.POST] = [seo.Response(200, {}, b"")]
+        self.change(t, word=b"again")
+        t[self.POST] = R(200)
         state, record, posts = self.go(t, state)
         self.assertEqual((len(posts), record["accepted"]), (1, 1))
-        del t[self.POST]  # the endpoint unreachable: recorded as a refusal, never a crash
-        t[("GET", "https://example.com/a")] = R(200, page("https://example.com/a").replace(b"word", b"third"), content_type="text/html")
+        del t[self.POST]  # the endpoint unreachable: a refusal, never a crash
+        self.change(t, word=b"third")
         _, record, _ = self.go(t, state)
         self.assertEqual((record["status"], record["failed"]), ([0], 1))
 
-    def test_batches_page_limits_dry_runs_and_dropped_urls(self):
+    def test_retry_after_defers_instead_of_retrying_early(self):
+        state = self.baseline()
+        t = self.site()
+        self.change(t)
+        t[self.POST] = R(429, retry_after="120")
+        state, record, posts = self.go(t, state)
+        self.assertEqual((len(posts), state["retry_after"]), (1, "2026-11-20T00:02:00Z"))  # one request: no early retry
+        _, deferred, posts = self.go(t, state, now="2026-11-20T00:01:00Z")
+        self.assertEqual(posts, [])
+        self.assertIn("deferred", deferred["notes"][0])
+        t[self.POST] = R(202)
+        state, record, posts = self.go(t, state, now="2026-11-20T00:03:00Z")
+        self.assertEqual((len(posts), record["accepted"], state["retry_after"]), (1, 1, ""))
+
+    def test_retry_after_forms(self):
+        now = datetime.datetime(2026, 11, 20, tzinfo=datetime.timezone.utc)
+        self.assertEqual(seo.retry_after(R(429, retry_after="7"), now), 7.0)
+        self.assertEqual(seo.retry_after(R(429, retry_after="Fri, 20 Nov 2026 00:05:00 GMT"), now), 300.0)
+        self.assertEqual(seo.retry_after(R(429, retry_after="Thu, 19 Nov 2026 00:00:00 GMT"), now), 0.0)
+        self.assertIsNone(seo.retry_after(R(429, retry_after="soon"), now))
+        self.assertIsNone(seo.retry_after(R(429), now))
+        slept = []
+        h = seo.Http(send=Fake({("GET", "https://example.com/x"): [R(429, retry_after="7"), R(503, retry_after="soon"), R(200)]}),
+                     sleep=slept.append)
+        self.assertEqual((h.get("https://example.com/x").status, slept), (200, [7.0, 4]))
+        h = seo.Http(send=Fake({("GET", "https://example.com/y"): [R(429, retry_after="120"), R(200)]}), sleep=slept.append)
+        self.assertEqual(h.get("https://example.com/y").status, 429)  # beyond the budget: returned, not retried early
+
+    def test_batches_page_limits_and_dry_runs(self):
         ledger = self.baseline()
-        ledger["urls"]["https://example.com/old"] = {"fingerprint": "x", "accepted": "x", "attempts": 0}
         for e in ledger["urls"].values():
-            e["accepted"] = e["fingerprint"] = "stale"
+            e["accepted"] = "stale"
         t = self.site()
         t[self.POST] = R(200)
-        old_batch, old_pages = seo.INDEXNOW_BATCH, seo.INDEXNOW_PAGES
-        self.addCleanup(setattr, seo, "INDEXNOW_BATCH", old_batch)
-        self.addCleanup(setattr, seo, "INDEXNOW_PAGES", old_pages)
+        for name, value in (("INDEXNOW_BATCH", 1), ("INDEXNOW_PAGES", seo.INDEXNOW_PAGES)):
+            self.addCleanup(setattr, seo, name, getattr(seo, name))
         seo.INDEXNOW_BATCH = 1
-        new, record, posts = self.go(t, json.loads(json.dumps(ledger)))
+        _, record, posts = self.go(t, copy_of(ledger))
         self.assertEqual((len(posts), record["accepted"]), (2, 2))
-        self.assertNotIn("https://example.com/old", new["urls"])
-        _, dry, posts = self.go(t, json.loads(json.dumps(ledger)), dry_run=True)
+        _, dry, posts = self.go(t, copy_of(ledger), dry_run=True)
         self.assertEqual((posts, len(dry["would_submit"])), ([], 2))
         seo.INDEXNOW_PAGES = 1
-        _, limited, _ = self.go(t, json.loads(json.dumps(ledger)))
+        _, limited, _ = self.go(t, copy_of(ledger))
         self.assertIn("only the first 1", " ".join(limited["notes"]))
 
-    def test_a_foreign_or_old_ledger_is_a_new_baseline(self):
-        for ledger in ({"version": 1, "host": "other.example", "urls": {}, "log": []}, {"version": 0}):
-            _, record, posts = self.go(self.site(), ledger)
-            self.assertEqual(posts, [])
-            self.assertIn("baseline", record["notes"][0])
-        log = {"version": 1, "host": "example.com", "urls": {}, "log": [{"n": i} for i in range(seo.LEDGER_LOG)]}
-        new, _, _ = self.go(self.site(), log)
-        self.assertEqual(len(new["log"]), seo.LEDGER_LOG)
+    def test_invalid_ledgers_start_a_new_baseline(self):
+        good = self.baseline()
+        bad_entry = copy_of(good)
+        bad_entry["urls"]["https://example.com/a"] = None
+        for ledger in ([1], "unreadable", {"version": 1, "host": "other.example", "urls": {}, "log": [], "initialized": True},
+                       {"version": 0}, bad_entry):
+            new, record, posts = self.go(self.site(), ledger)
+            self.assertEqual((posts, new["initialized"]), ([], True))
+            self.assertIn("not a valid version-1 ledger", record["notes"][0])
+        log = copy_of(good)
+        log["log"] = [{"n": i} for i in range(seo.LEDGER_LOG)]
+        self.assertEqual(len(self.go(self.site(), log)[0]["log"]), seo.LEDGER_LOG)
 
-    def test_retry_after_is_honoured(self):
-        slept = []
-        fake = Fake({("GET", "https://example.com/x"): [R(429, retry_after="7"), R(503, retry_after="soon"), R(200)]})
-        h = seo.Http(send=fake, sleep=slept.append)
-        self.assertEqual(h.get("https://example.com/x").status, 200)
-        self.assertEqual(slept, [7.0, 4])
-
-    def test_fingerprint_is_what_a_reader_sees(self):
-        a = seo.fingerprint(seo.Page(page().decode()))
-        self.assertEqual(a, seo.fingerprint(seo.Page(page().replace(b"<h1>", b"<script>v2()</script><h1>").decode())))
-        self.assertNotEqual(a, seo.fingerprint(seo.Page(page().replace(b"word", b"other").decode())))
-
-    def test_ledger_artifacts(self):
+    def test_ledger_artifacts_only_from_the_default_branch_of_this_repository(self):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as z:
-            z.writestr("ledger.json", json.dumps({"version": 1}))
-        api = "https://api.github.com/repos/o/r/actions/artifacts?name=seo-standard-indexnow-ledger&per_page=20"
+            z.writestr("ledger.json", json.dumps({"version": 1, "from": "main"}))
+        run = lambda branch, head=1: {"head_branch": branch, "repository_id": 1, "head_repository_id": head}  # noqa: E731
+        api = "https://api.github.com/repos/o/r/actions/artifacts?name=seo-standard-indexnow-ledger&per_page=100"
         listing = json.dumps({"artifacts": [
-            {"expired": True, "created_at": "2026-11-21", "archive_download_url": "https://api.github.com/zip/expired"},
-            {"expired": False, "created_at": "2026-11-19", "archive_download_url": "https://api.github.com/zip/old"},
-            {"expired": False, "created_at": "2026-11-20", "archive_download_url": "https://api.github.com/zip/new"}]}).encode()
+            {"expired": True, "created_at": "2026-11-23", "workflow_run": run("main"), "archive_download_url": "https://api.github.com/zip/expired"},
+            {"expired": False, "created_at": "2026-11-22", "workflow_run": run("feature"), "archive_download_url": "https://api.github.com/zip/feature"},
+            {"expired": False, "created_at": "2026-11-21", "workflow_run": run("main", head=2), "archive_download_url": "https://api.github.com/zip/fork"},
+            {"expired": False, "created_at": "2026-11-19", "workflow_run": run("main"), "archive_download_url": "https://api.github.com/zip/old"},
+            {"expired": False, "created_at": "2026-11-20", "workflow_run": run("main"), "archive_download_url": "https://api.github.com/zip/new"},
+            "not an artifact"]}).encode()
         t = {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(302, location="https://blob.example/z"),
              ("GET", "https://blob.example/z"): R(200, buf.getvalue())}
         h, fake = http(t)
-        self.assertEqual(seo.fetch_ledger(h, "o/r", "tok"), {"version": 1})
+        self.assertEqual(seo.fetch_ledger(h, "o/r", "tok", "main"), {"version": 1, "from": "main"})
         self.assertEqual(dict(fake.calls[0][1])["Authorization"], "Bearer tok")
-        for table in ({("GET", api): R(403)}, {("GET", api): R(200, b'{"artifacts": []}')},
+        self.assertNotIn("Authorization", dict(fake.calls[-1][1]))  # never sent to signed storage
+        for table in ({("GET", api): R(403)}, {("GET", api): R(200, b"[1]")}, {("GET", api): R(200, b"not json")},
+                      {("GET", api): R(200, b'{"artifacts": []}')},
                       {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(410)},
                       {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(200, b"not a zip")}):
-            self.assertIsNone(seo.fetch_ledger(http(table)[0], "o/r", "tok"))
+            self.assertIsNone(seo.fetch_ledger(http(table)[0], "o/r", "tok", "main"))
+        self.assertIsNone(seo.fetch_ledger(http({("GET", api): R(200, listing)})[0], "o/r", "tok", "release"))
 
     def test_cli(self):
         d = tempfile.mkdtemp()
@@ -649,6 +726,7 @@ class IndexNow(unittest.TestCase):
         base = ["indexnow", "--canonical", "https://example.com", "--sitemap", SITEMAP, "--key", self.KEY, "--ledger-out", out]
         with redirect_stderr(io.StringIO()):
             self.assertEqual(seo.main(["indexnow", "--canonical", "http://x", "--key", "k", "--ledger-out", out]), 2)
+            self.assertEqual(seo.main(base + ["--repo", "o/r"]), 2)  # --repo needs --branch
         with redirect_stdout(io.StringIO()) as o:
             self.assertEqual(seo.main(base, http(self.site())[0]), 0)
         self.assertIn("baseline", o.getvalue())
@@ -658,20 +736,24 @@ class IndexNow(unittest.TestCase):
         self.assertEqual(seo.main(base + ["--ledger-in", prev, "--md", md], http(self.site())[0]), 0)
         shutil.copy(out, prev)
         t = self.site()
+        self.change(t, word=b"new")
         t[self.POST] = R(202)
-        t[("GET", "https://example.com/a")] = R(200, page("https://example.com/a").replace(b"word", b"new"), content_type="text/html")
         self.assertEqual(seo.main(base + ["--ledger-in", prev, "--md", md, "--sha", "s"], http(t)[0]), 0)
         with open(md) as f:
-            self.assertIn("1 changed URLs submitted, 1 accepted", f.read())
-        api = "https://api.github.com/repos/o/r/actions/artifacts?name=seo-standard-indexnow-ledger&per_page=20"
+            self.assertIn("1 changed URLs submitted, 1 accepted, 0 refused (HTTP 202)", f.read())
+        api = "https://api.github.com/repos/o/r/actions/artifacts?name=seo-standard-indexnow-ledger&per_page=100"
         t2 = self.site()
         t2[("GET", api)] = R(404)
         with redirect_stdout(io.StringIO()):
-            self.assertEqual(seo.main(base + ["--repo", "o/r"], http(t2)[0], env={"GITHUB_TOKEN": "t"}), 0)
+            self.assertEqual(seo.main(base + ["--repo", "o/r", "--branch", "main"], http(t2)[0], env={"GITHUB_TOKEN": "t"}), 0)
         t3 = self.site()
         del t3[("GET", f"https://example.com/{self.KEY}.txt")]
         with redirect_stderr(io.StringIO()):
             self.assertEqual(seo.main(base, http(t3)[0]), 2)
+
+
+def copy_of(value):
+    return json.loads(json.dumps(value))
 
 
 class PreviewResolution(unittest.TestCase):
@@ -712,13 +794,24 @@ class PreviewResolution(unittest.TestCase):
         h, _ = self.api({"check_runs": [old_ok, running]},
                         {"check_runs": [old_ok, dict(running, status="completed", conclusion="success")]})
         self.assertEqual(self.wait(h)["id"], 3, "a newer running deploy is waited for, not the older success")
+        queued = {"id": 4, "started_at": None, "status": "queued"}
+        h, _ = self.api({"check_runs": [old_ok, queued]},
+                        {"check_runs": [old_ok, dict(queued, status="completed", conclusion="failure")]})
+        with self.assertRaisesRegex(RuntimeError, "concluded failure"):
+            self.wait(h)
+
+    def test_requests_never_outlast_the_deadline(self):
+        h, _ = self.api({"check_runs": [self.WORKERS]})
+        h.timeout = 20
+        seo.wait_for_check(h, "o/r", "abc", "Workers Builds: peeps-web", "t", 5, 1, iter([0, 1, 2]).__next__, lambda s: None)
+        self.assertEqual(h.timeout, 4)
 
     def test_every_page_of_the_listing_is_read(self):
         page2 = self.URL + "&page=2"
         h, _ = http({("GET", self.URL): R(200, json.dumps({"check_runs": [dict(self.WORKERS, started_at="1")]}).encode(),
                                           link=f'<{page2}>; rel="next"'),
                      ("GET", page2): R(200, json.dumps({"check_runs": [dict(self.PAGES, started_at="2")]}).encode())})
-        self.assertEqual(self.wait(h)["id"], 1)
+        self.assertEqual(self.wait(h)["id"], 2, "the highest id across every page")
 
     def test_failure_timeout_and_api_errors(self):
         h, _ = self.api({"check_runs": [{"status": "completed", "conclusion": "failure"}]})
