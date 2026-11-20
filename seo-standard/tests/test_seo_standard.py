@@ -4,6 +4,7 @@ wildcards, crawler-scoped X-Robots-Tag, MIME-only HTML detection, sampled-page c
 sitemap origins, unreachable sites exiting 2).
 Run: python3 -I -m unittest discover -s seo-standard/tests -v
 """
+import datetime
 import io
 import json
 import os
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -58,11 +60,12 @@ def live(origin="https://example.com"):
 
 class Fake:
     def __init__(self, table):
-        self.table, self.calls = dict(table), []
+        self.table, self.calls, self.bodies = dict(table), [], []
 
     def __call__(self, req, timeout):
         key = (req.get_method(), req.full_url)
         self.calls.append((key, dict(req.header_items())))
+        self.bodies.append(req.data)
         if key not in self.table:
             raise urllib.error.URLError(f"no route {key}")
         v = self.table[key]
@@ -496,6 +499,315 @@ class DiscoverabilityGaps(unittest.TestCase):
             extra = b'<meta name="robots" content="noindex">' if i == 6 else b""
             t[("GET", u)] = R(200, page(u, extra), content_type="text/html")
         self.assertIn("sitemap-url-noindex", codes(run(t), "critical"))
+
+
+class IndexNow(unittest.TestCase):
+    """Only eligible, self-canonical URLs whose content changed since IndexNow last accepted them,
+    only after this invocation's deploy succeeded, with a ledger of every submission and refusal.
+    Includes the regressions from independent review of #31 at 1cfa394."""
+
+    KEY = "0123456789abcdef"
+    POST = ("POST", seo.INDEXNOW_ENDPOINT)
+    NOW = "2026-11-20T00:00:00Z"
+
+    def site(self):
+        t = live()
+        t[("GET", f"https://example.com/{self.KEY}.txt")] = R(200, self.KEY.encode() + b"\n", content_type="text/plain")
+        return t
+
+    def go(self, table, ledger=None, now=None, **kw):
+        h, fake = http(table)
+        kw.setdefault("clock", lambda: seo._when(now or self.NOW))
+        new, record = seo.indexnow(CANON, [SITEMAP], self.KEY, ledger, h, "abc123", now or self.NOW, **kw)
+        return new, record, [json.loads(b) for (k, _), b in zip(fake.calls, fake.bodies) if k == self.POST]
+
+    def baseline(self, table=None):
+        new, record, posts = self.go(table or self.site())
+        self.assertEqual((posts, new["initialized"]), ([], True))
+        return new
+
+    def change(self, t, url="https://example.com/a", word=b"changed"):
+        t[("GET", url)] = R(200, page(url).replace(b"word", word), content_type="text/html")
+
+    def test_the_deploy_gate_is_this_invocations_step_output(self):
+        with open(os.path.join(os.path.dirname(seo.__file__), "action.yml"), encoding="utf-8") as f:
+            action = f.read()
+        gate = next(line for line in action.splitlines() if "inputs.indexnow-key != ''" in line)
+        self.assertIn("steps.seo.outputs.deployed == 'true'", gate)
+        self.assertIn("github.event_name == 'push'", gate)
+        self.assertIn("refs/heads/{0}', github.event.repository.default_branch", gate)
+        wait, mark = action.index("--wait-only"), action.index('echo "deployed=true" >> "$GITHUB_OUTPUT"')
+        self.assertLess(wait, mark)  # written only after the wait returned successfully (set -e)
+        self.assertNotIn("seo-standard-deployed", action)  # no shared marker another invocation could leave
+        self.assertIn("name: ${{ steps.indexnow.outputs.name }}", action)  # one ledger per site and workflow
+
+    def test_the_hosted_key_is_verified_first_and_a_failed_first_run_is_not_a_baseline(self):
+        t = self.site()
+        t[("GET", f"https://example.com/{self.KEY}.txt")] = R(404)
+        new, record, posts = self.go(t)
+        self.assertEqual((posts, new["initialized"]), ([], False))
+        self.assertIn("without the key", record["notes"][0])
+        t = self.site()
+        self.change(t)
+        t[self.POST] = R(200)
+        after, record, posts = self.go(t, new)
+        self.assertEqual(posts, [])  # the first successful run is the baseline, never a full submission
+        self.assertIn("baseline", record["notes"][-1])
+
+    def test_unreadable_robots_submits_nothing(self):
+        for status in (503, 200):
+            t = self.site()
+            t[("GET", "https://example.com/robots.txt")] = R(status, HOME if status == 200 else b"")
+            new, record, posts = self.go(t)
+            self.assertEqual((posts, new["initialized"]), ([], False))
+            self.assertIn("nothing is submitted", record["notes"][0])
+
+    def test_an_unreadable_sitemap_is_never_a_baseline(self):
+        for broken in (R(503), R(200, HOME, content_type="text/html")):
+            t = self.site()
+            t[("GET", SITEMAP)] = broken
+            new, record, posts = self.go(t)
+            self.assertEqual((posts, new["initialized"], new["urls"]), ([], False, {}))
+            self.assertIn("could not be read", record["notes"][-1])
+            after, record, posts = self.go(self.site(), new)
+            self.assertEqual((posts, after["initialized"]), ([], True))  # recovery is the baseline
+
+    def test_invalid_timestamps_start_a_new_baseline(self):
+        good = self.baseline()
+        for field, where in (("seen", "url"), ("accepted_at", "url"), ("retry_after", "ledger")):
+            bad = copy_of(good)
+            target = bad["urls"]["https://example.com/a"] if where == "url" else bad
+            target[field] = "not-a-date"
+            t = self.site()
+            self.change(t)
+            new, record, posts = self.go(t, bad)
+            self.assertEqual(posts, [])
+            self.assertIn("not a valid version-1 ledger", record["notes"][0])
+
+    def test_a_baseline_then_only_changed_urls_once(self):
+        ledger = self.baseline()
+        self.assertEqual(sorted(ledger["urls"]), ["https://example.com/", "https://example.com/a"])
+        t = self.site()
+        t[("GET", "https://example.com/robots.txt")] = R(404)  # no robots.txt: everything is allowed
+        self.change(t)
+        t[self.POST] = R(202)
+        new, record, posts = self.go(t, ledger)
+        self.assertEqual(posts, [{"host": "example.com", "key": self.KEY, "keyLocation": f"https://example.com/{self.KEY}.txt",
+                                  "urlList": ["https://example.com/a"]}])
+        self.assertEqual((record["accepted"], new["urls"]["https://example.com/a"]["accepted_at"]), (1, self.NOW))
+        _, again, posts = self.go(t, new)
+        self.assertEqual(posts, [])
+        self.assertIn("no eligible URL changed", again["notes"][0])
+
+    def test_markup_and_formatting_only_rebuilds_are_not_changes(self):
+        ledger = self.baseline()
+        t = self.site()
+        body = page("https://example.com/a").replace(b"word word", b"wo<span>rd</span> <b>word</b>", 1)
+        body = body.replace(b'{"@type": "Organization"}', b'{ "@type" : "Organization" }').replace(b"<h1>", b"<script src='/x.9f3a.js'></script><h1 class='v2'>")
+        t[("GET", "https://example.com/a")] = R(200, body, content_type="text/html")
+        _, _, posts = self.go(t, ledger)
+        self.assertEqual(posts, [])
+        broken = seo.Page(page().replace(b'{"@type": "Organization"}', b'{ broken  json').decode())
+        spaced = seo.Page(page().replace(b'{"@type": "Organization"}', b'{   broken json ').decode())
+        self.assertEqual(seo.fingerprint(broken, CANON), seo.fingerprint(spaced, CANON))  # invalid JSON-LD: by its text
+
+    def test_only_eligible_self_canonical_urls_on_the_production_origin(self):
+        urls = ["https://example.com/", "https://other.example/x", "http://example.com/plain", "https://example.com:8443/port",
+                "https://example.com/#frag", "https://example.com/private", "https://example.com/gone", "https://example.com/hidden",
+                "https://example.com/scoped", "https://example.com/elsewhere", "https://example.com/portcanon",
+                "https://example.com/basecanon", "https://example.com/nocanon", "https://example.com/badcanon", "https://example.com:x/bad",
+                "https://example.com/googlebot-only"]
+        t = self.site()
+        t[("GET", SITEMAP)] = R(200, b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                                + b"".join(b"<url><loc>" + u.encode() + b"</loc></url>" for u in urls) + b"</urlset>",
+                                content_type="application/xml")
+        t[("GET", "https://example.com/robots.txt")] = R(200, ROBOTS + b"User-agent: bingbot\nDisallow: /private\n", content_type="text/plain")
+        t[("GET", "https://example.com/gone")] = R(404)
+        t[("GET", "https://example.com/hidden")] = R(200, page("https://example.com/hidden", b'<meta name="robots" content="noindex">'))
+        t[("GET", "https://example.com/scoped")] = R(200, page("https://example.com/scoped"), x_robots_tag="bingbot: noindex")
+        t[("GET", "https://example.com/elsewhere")] = R(200, page("https://example.com/"))
+        t[("GET", "https://example.com/portcanon")] = R(200, page("https://example.com:8443/portcanon"))
+        t[("GET", "https://example.com/basecanon")] = R(200, page("/basecanon", b'<base href="https://other.example/">'))
+        t[("GET", "https://example.com/nocanon")] = R(200, page("").replace(b'<link rel="canonical" href="">', b""))
+        t[("GET", "https://example.com/badcanon")] = R(200, page("https://example.com:bad/badcanon"))
+        t[("GET", "https://example.com/googlebot-only")] = R(200, page("https://example.com/googlebot-only"), x_robots_tag="googlebot: noindex")
+        new = self.baseline(t)
+        self.assertEqual(sorted(new["urls"]), ["https://example.com/", "https://example.com/googlebot-only"])
+
+    def test_a_url_missing_for_a_while_keeps_its_history(self):
+        ledger = self.baseline()
+        t = self.site()
+        self.change(t)
+        t[self.POST] = R(200)
+        accepted, _, posts = self.go(t, ledger)
+        self.assertEqual(len(posts), 1)
+        gone = self.site()
+        gone[("GET", "https://example.com/a")] = R(404)
+        kept, _, _ = self.go(gone, accepted)
+        self.assertFalse(kept["urls"]["https://example.com/a"]["eligible"])
+        _, record, posts = self.go(t, kept)  # back, exactly as accepted: not a change
+        self.assertEqual(posts, [])
+        old = self.go(t, kept, now="2027-12-01T00:00:00Z")[0]
+        self.assertIn("https://example.com/", old["urls"])  # seen again on this run, so kept
+        stale = json.loads(json.dumps(kept))
+        stale["urls"]["https://example.com/a"]["seen"] = "2025-01-01T00:00:00Z"
+        forgotten, _, _ = self.go(gone, stale)
+        self.assertNotIn("https://example.com/a", forgotten["urls"])
+
+    def test_refusals_are_recorded_retried_and_capped(self):
+        state = self.baseline()
+        t = self.site()
+        self.change(t)
+        t[self.POST] = R(422)
+        for _ in range(seo.INDEXNOW_ATTEMPTS):
+            state, record, posts = self.go(t, state)
+            self.assertEqual((len(posts), record["failed"], record["status"]), (1, 1, [422]))
+        state, record, posts = self.go(t, state)
+        self.assertEqual(posts, [])  # capped until the page changes again
+        self.change(t, word=b"again")
+        t[self.POST] = R(200)
+        state, record, posts = self.go(t, state)
+        self.assertEqual((len(posts), record["accepted"]), (1, 1))
+        del t[self.POST]  # the endpoint unreachable: a refusal, never a crash
+        self.change(t, word=b"third")
+        _, record, _ = self.go(t, state)
+        self.assertEqual((record["status"], record["failed"]), ([0], 1))
+
+    def test_retry_after_defers_instead_of_retrying_early(self):
+        state = self.baseline()
+        t = self.site()
+        self.change(t)
+        t[self.POST] = R(429, retry_after="120")
+        state, record, posts = self.go(t, state)
+        self.assertEqual((len(posts), state["retry_after"]), (1, "2026-11-20T00:02:00Z"))  # one request: no early retry
+        late = seo._when("2026-11-20T00:03:00Z")  # the final 429 arrived after Http's own retries
+        delayed, _, _ = self.go(t, copy_of(state), now="2026-11-20T00:02:30Z", clock=lambda: late)
+        self.assertEqual(delayed["retry_after"], "2026-11-20T00:05:00Z")
+        _, deferred, posts = self.go(t, state, now="2026-11-20T00:01:00Z")
+        self.assertEqual(posts, [])
+        self.assertIn("deferred", deferred["notes"][0])
+        t[self.POST] = R(202)
+        state, record, posts = self.go(t, state, now="2026-11-20T00:03:00Z")
+        self.assertEqual((len(posts), record["accepted"], state["retry_after"]), (1, 1, ""))
+
+    def test_retry_after_forms(self):
+        now = datetime.datetime(2026, 11, 20, tzinfo=datetime.timezone.utc)
+        self.assertEqual(seo.retry_after(R(429, retry_after="7"), now), 7.0)
+        self.assertEqual(seo.retry_after(R(429, retry_after="Fri, 20 Nov 2026 00:05:00 GMT"), now), 300.0)
+        self.assertEqual(seo.retry_after(R(429, retry_after="Thu, 19 Nov 2026 00:00:00 GMT"), now), 0.0)
+        self.assertIsNone(seo.retry_after(R(429, retry_after="soon"), now))
+        self.assertIsNone(seo.retry_after(R(429), now))
+        slept = []
+        h = seo.Http(send=Fake({("GET", "https://example.com/x"): [R(429, retry_after="7"), R(503, retry_after="soon"), R(200)]}),
+                     sleep=slept.append)
+        self.assertEqual((h.get("https://example.com/x").status, slept), (200, [7.0, 4]))
+        h = seo.Http(send=Fake({("GET", "https://example.com/y"): [R(429, retry_after="120"), R(200)]}), sleep=slept.append)
+        self.assertEqual(h.get("https://example.com/y").status, 429)  # beyond the budget: returned, not retried early
+
+    def test_batches_page_limits_and_dry_runs(self):
+        ledger = self.baseline()
+        for e in ledger["urls"].values():
+            e["accepted"] = "stale"
+        t = self.site()
+        t[self.POST] = R(200)
+        for name, value in (("INDEXNOW_BATCH", 1), ("INDEXNOW_PAGES", seo.INDEXNOW_PAGES)):
+            self.addCleanup(setattr, seo, name, getattr(seo, name))
+        seo.INDEXNOW_BATCH = 1
+        _, record, posts = self.go(t, copy_of(ledger))
+        self.assertEqual((len(posts), record["accepted"]), (2, 2))
+        _, dry, posts = self.go(t, copy_of(ledger), dry_run=True)
+        self.assertEqual((posts, len(dry["would_submit"])), ([], 2))
+        seo.INDEXNOW_PAGES = 1
+        _, limited, _ = self.go(t, copy_of(ledger))
+        self.assertIn("only the first 1", " ".join(limited["notes"]))
+
+    def test_invalid_ledgers_start_a_new_baseline(self):
+        good = self.baseline()
+        bad_entry = copy_of(good)
+        bad_entry["urls"]["https://example.com/a"] = None
+        for ledger in ([1], "unreadable", {"version": 1, "host": "other.example", "urls": {}, "log": [], "initialized": True},
+                       {"version": 0}, bad_entry):
+            new, record, posts = self.go(self.site(), ledger)
+            self.assertEqual((posts, new["initialized"]), ([], True))
+            self.assertIn("not a valid version-1 ledger", record["notes"][0])
+        log = copy_of(good)
+        log["log"] = [{"n": i} for i in range(seo.LEDGER_LOG)]
+        self.assertEqual(len(self.go(self.site(), log)[0]["log"]), seo.LEDGER_LOG)
+
+    def test_ledger_artifacts_only_from_the_default_branch_of_this_repository(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("ledger.json", json.dumps({"version": 1, "from": "main"}))
+        run = lambda branch, head=1: {"head_branch": branch, "repository_id": 1, "head_repository_id": head}  # noqa: E731
+        name = seo.ledger_name(CANON, "o/r/.github/workflows/seo.yml@refs/heads/main")
+        self.assertEqual(name, seo.ledger_name(CANON, "o/r/.github/workflows/seo.yml@refs/tags/v2"))  # the ref does not matter
+        self.assertNotEqual(name, seo.ledger_name(CANON, "o/r/.github/workflows/other.yml@refs/heads/main"))
+        self.assertNotEqual(seo.ledger_name(CANON, "o/r/.github/workflows/seo@prod.yml@refs/heads/main"),
+                            seo.ledger_name(CANON, "o/r/.github/workflows/seo@nightly.yml@refs/heads/main"))
+        self.assertNotEqual(name, seo.ledger_name("https://other.example/", "o/r/.github/workflows/seo.yml@refs/heads/main"))
+        api = f"https://api.github.com/repos/o/r/actions/artifacts?name={name}&per_page=100"
+        listing = json.dumps({"artifacts": [{**a, "name": name} if isinstance(a, dict) else a for a in [
+            {"expired": True, "created_at": "2026-11-23", "workflow_run": run("main"), "archive_download_url": "https://api.github.com/zip/expired"},
+            {"expired": False, "created_at": "2026-11-22", "workflow_run": run("feature"), "archive_download_url": "https://api.github.com/zip/feature"},
+            {"expired": False, "created_at": "2026-11-21", "workflow_run": run("main", head=2), "archive_download_url": "https://api.github.com/zip/fork"},
+            {"expired": False, "created_at": "2026-11-19", "workflow_run": run("main"), "archive_download_url": "https://api.github.com/zip/old"},
+            {"expired": False, "created_at": "2026-11-20", "workflow_run": run("main"), "archive_download_url": "https://api.github.com/zip/new"},
+            "not an artifact"]] + [{"name": "seo-standard-indexnow-ledger-example.com-otherworkflow", "expired": False,
+                                    "created_at": "2026-11-24", "workflow_run": run("main"),
+                                    "archive_download_url": "https://api.github.com/zip/other-workflow"}]}).encode()
+        t = {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(302, location="https://blob.example/z"),
+             ("GET", "https://blob.example/z"): R(200, buf.getvalue())}
+        h, fake = http(t)
+        self.assertEqual(seo.fetch_ledger(h, "o/r", "tok", "main", name), {"version": 1, "from": "main"})
+        self.assertEqual(dict(fake.calls[0][1])["Authorization"], "Bearer tok")
+        self.assertNotIn("Authorization", dict(fake.calls[-1][1]))  # never sent to signed storage
+        for table in ({("GET", api): R(403)}, {("GET", api): R(200, b"[1]")}, {("GET", api): R(200, b"not json")},
+                      {("GET", api): R(200, b'{"artifacts": []}')},
+                      {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(410)},
+                      {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(200, b"not a zip")}):
+            self.assertIsNone(seo.fetch_ledger(http(table)[0], "o/r", "tok", "main", name))
+        self.assertIsNone(seo.fetch_ledger(http({("GET", api): R(200, listing)})[0], "o/r", "tok", "release", name))
+
+    def test_cli(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        out, md, prev = os.path.join(d, "l.json"), os.path.join(d, "s.md"), os.path.join(d, "p.json")
+        base = ["indexnow", "--canonical", "https://example.com", "--sitemap", SITEMAP, "--key", self.KEY, "--ledger-out", out]
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(seo.main(["indexnow", "--canonical", "http://x", "--key", "k", "--ledger-out", out]), 2)
+            self.assertEqual(seo.main(base + ["--repo", "o/r"]), 2)  # --repo needs --branch
+        with redirect_stdout(io.StringIO()) as o:
+            self.assertEqual(seo.main(base, http(self.site())[0]), 0)
+        self.assertIn("baseline", o.getvalue())
+        self.assertIn("not proof of crawling or indexing", o.getvalue())
+        with open(prev, "w") as f:
+            f.write("not json")
+        self.assertEqual(seo.main(base + ["--ledger-in", prev, "--md", md], http(self.site())[0]), 0)
+        shutil.copy(out, prev)
+        t = self.site()
+        self.change(t, word=b"new")
+        t[self.POST] = R(202)
+        self.assertEqual(seo.main(base + ["--ledger-in", prev, "--md", md, "--sha", "s"], http(t)[0]), 0)
+        with open(md) as f:
+            self.assertIn("1 changed URLs submitted, 1 accepted, 0 refused (HTTP 202)", f.read())
+        wf = "o/r/.github/workflows/seo.yml@refs/heads/main"
+        api = f"https://api.github.com/repos/o/r/actions/artifacts?name={seo.ledger_name(CANON, wf)}&per_page=100"
+        with redirect_stdout(io.StringIO()) as named:
+            self.assertEqual(seo.main(base + ["--workflow", wf, "--print-ledger-name"]), 0)
+        self.assertEqual(named.getvalue().strip(), seo.ledger_name(CANON, wf))
+        t2 = self.site()
+        t2[("GET", api)] = R(404)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(seo.main(base + ["--repo", "o/r", "--branch", "main", "--workflow", wf], http(t2)[0],
+                                      env={"GITHUB_TOKEN": "t"}), 0)
+        t3 = self.site()
+        del t3[("GET", f"https://example.com/{self.KEY}.txt")]
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(seo.main(base, http(t3)[0]), 2)
+
+
+def copy_of(value):
+    return json.loads(json.dumps(value))
 
 
 class PreviewResolution(unittest.TestCase):

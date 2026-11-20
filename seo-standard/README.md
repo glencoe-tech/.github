@@ -96,6 +96,41 @@ their own.
 **Info:** no structured data; which training crawlers (`GPTBot`, `Google-Extended`, `CCBot`, …)
 are blocked. Blocking those is a legitimate choice for each client.
 
+## IndexNow (after a production deploy)
+
+Set `indexnow-key` to tell IndexNow (Bing, Yandex, Seznam, Naver and others) which pages changed.
+The site must serve the key at `https://<host>/<key>.txt`. The key is public by design and is not
+a credential. Give the job `actions: read` as well as `checks: read`.
+
+- **When:** only on a push to the default branch, and only after this invocation's deploy check
+  succeeded for that commit (a step output, never a shared file). A failed or skipped deploy
+  submits nothing. Pull requests and previews never submit.
+- **What:** only eligible sitemap URLs. An eligible URL is on the production origin (scheme, host
+  and port), has no `#fragment`, is allowed for Bingbot, answers 200, is not `noindex`, and names
+  exactly itself as canonical. The canonical is required, and is resolved against `<base href>`.
+- **Changed only:** each URL gets a fingerprint of what a reader sees (title, description,
+  canonical, served text with inline markup ignored, JSON-LD in canonical form). A URL is submitted
+  only when its fingerprint differs from the one IndexNow last accepted.
+  - A markup-only or asset-hash rebuild submits nothing.
+  - No URL is submitted until one run has completed a baseline. A run where the key, robots.txt,
+    a sitemap (child sitemaps included) or the site could not be read records nothing as accepted.
+  - A URL missing for a while keeps its accepted fingerprint, so its return unchanged is not a
+    change. It is forgotten after 365 days unseen.
+- **Limits and retries:**
+  - At most 10,000 URLs per request and 1,000 pages per run.
+  - 429 and 5xx are retried with backoff, honouring `Retry-After` in seconds or as an HTTP-date.
+    When the server asks for more than 60 seconds, the run does not retry early: it records the
+    time, counted from when the final response arrived, and later runs defer until then.
+  - A refused change is retried at most 5 times, until the page changes again.
+- **Records:** the ledger (fingerprints plus the last 200 submissions, with status codes and notes)
+  is kept as an artifact for 90 days. It is named `seo-standard-indexnow-ledger-<host>-<hash of the
+  calling workflow file>`, so each site and workflow keeps its own. Only artifacts with exactly that
+  name from this repository's default-branch runs are read; never a fork's, another branch's or
+  another workflow's. An invalid ledger, including a bad timestamp, starts a new baseline, and the
+  reason is recorded. The job summary shows each run.
+- **Not proof of indexing:** "accepted" means IndexNow received the URLs, nothing more. Coverage
+  comes from Search Console and Bing Webmaster Tools.
+
 ## Previews
 
 The deploy check tells the action where the preview is:
