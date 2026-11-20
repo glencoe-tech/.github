@@ -36,13 +36,13 @@ Repository instructions may be stricter; they may not weaken that standard.
 - **Deployment secrets live in GitHub.** When GitHub runs a deployment, every secret it needs
   (runtime, build and the deploy credential) is a secret of the repository's GitHub environment for
   that target; a production environment admits only the default branch. They change
-  only inside the deploy pipeline: for a Worker, sent with each release (`wrangler deploy
-  --secrets-file`, which adds and overwrites but never deletes) and removed by `wrangler versions secret
-  delete` between upload and deploy; a deploy-job step only for providers without that option (Pages
-  direct upload, Supabase).
-  Never `wrangler secret put` or `secret bulk` on a Worker, even in a pipeline: each deploys the last
-  uploaded version. No change by hand, no dashboard edit. Builds Cloudflare runs from git (Workers
-  Builds, Pages git builds, their previews) are exempt.
+  only inside the deploy pipeline: for a Worker, sent with each release
+  (`wrangler deploy --secrets-file`, which adds and overwrites but never deletes) and removed by
+  `wrangler versions secret delete` between upload and deploy; a deploy-job step only for providers
+  without that option (Pages direct upload, Supabase). Never `wrangler secret put` or `secret bulk`
+  on a Worker, even in a pipeline: each deploys the last uploaded version. No change by hand, no
+  dashboard edit. Builds Cloudflare runs from git (Workers Builds, Pages git builds, their previews)
+  are exempt.
 - Preserve repository-specific architecture and conventions; standardize behavior, not filenames.
 - **Environment lifecycle is part of completion.** Use the declared Docker/container environment
   for dependency installation, builds, testing, and packaging. A necessary native/local fallback
