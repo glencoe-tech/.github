@@ -18,6 +18,11 @@
       "docs": ["hosting-standard/README.md"]
     },
     {
+      "id": "seo-standard-check",
+      "paths": ["seo-standard/action.yml", "seo-standard/seo_standard.py"],
+      "docs": ["seo-standard/README.md"]
+    },
+    {
       "id": "api-contract-check",
       "paths": ["api-contract/action.yml", "api-contract/src/**", "api-contract/rulesets/**", "api-contract/oasdiff/**"],
       "docs": ["api-contract/README.md"]

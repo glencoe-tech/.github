@@ -1,0 +1,93 @@
+name: seo-standard
+description: >-
+  The Glencoe Website SEO Standard check (glencoe-tech/governance docs/WEBSITE-SEO-STANDARD.md).
+  On a pull request it waits for the deploy check to build the preview and audits that preview as
+  the production site it will become; on a push to the default branch it waits for the deploy and
+  audits the live site. Critical findings fail; warnings are annotations. Reference by full commit
+  SHA: glencoe-tech/.github/seo-standard@<sha>.
+
+# A composite action: the engine that runs is exactly the one at the SHA the caller pinned, read
+# from $GITHUB_ACTION_PATH. Standard-library Python 3.11+ (preinstalled on GitHub-hosted runners).
+# Inputs reach the script through env, never spliced into the shell. It needs `checks: read` to
+# see the deploy check, and nothing else.
+
+inputs:
+  canonical:
+    description: The production homepage, e.g. https://example.com/
+    required: true
+  sitemaps:
+    description: Production sitemap URLs, space- or newline-separated.
+    required: true
+  deploy-check:
+    description: >-
+      The deploy check run to wait for, e.g. "Workers Builds: my-worker" or "Cloudflare Pages".
+      Empty: do not wait (only for mode production or artifact).
+    required: false
+    default: ""
+  workers-subdomain:
+    description: The account's workers.dev subdomain (Workers Builds previews), e.g. glencoe-delivery.
+    required: false
+    default: ""
+  private-hosts:
+    description: Hosts that must never be indexable (production mode), space-separated.
+    required: false
+    default: ""
+  mode:
+    description: auto (pull_request = preview, otherwise production), preview, production, or artifact.
+    required: false
+    default: auto
+  dist:
+    description: artifact mode only, the build output directory.
+    required: false
+    default: ""
+  timeout:
+    description: Seconds to wait for the deploy check.
+    required: false
+    default: "900"
+  token:
+    description: Token that can read check runs on this repository.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: SEO standard
+      shell: bash
+      env:
+        ENGINE: ${{ github.action_path }}/seo_standard.py
+        CANONICAL: ${{ inputs.canonical }}
+        SITEMAPS: ${{ inputs.sitemaps }}
+        CHECK: ${{ inputs.deploy-check }}
+        SUBDOMAIN: ${{ inputs.workers-subdomain }}
+        PRIVATE_HOSTS: ${{ inputs.private-hosts }}
+        MODE: ${{ inputs.mode }}
+        DIST: ${{ inputs.dist }}
+        TIMEOUT: ${{ inputs.timeout }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        EVENT: ${{ github.event_name }}
+        REPO: ${{ github.repository }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      run: |
+        set -euo pipefail
+        mode="$MODE"
+        if [ "$mode" = auto ]; then
+          if [ "$EVENT" = pull_request ]; then mode=preview; else mode=production; fi
+        fi
+        args=(audit --canonical "$CANONICAL" --mode "$mode" --github --md "$GITHUB_STEP_SUMMARY" --json "$RUNNER_TEMP/seo-standard.json")
+        for s in $SITEMAPS; do args+=(--sitemap "$s"); done
+        for h in $PRIVATE_HOSTS; do args+=(--private-host "$h"); done
+        case "$mode" in
+          preview)
+            [ -n "$CHECK" ] || { echo "::error::seo-standard: preview mode needs deploy-check"; exit 2; }
+            base=$(python3 -I "$ENGINE" preview --repo "$REPO" --sha "$HEAD_SHA" --check "$CHECK" \
+              --workers-subdomain "$SUBDOMAIN" --timeout "$TIMEOUT")
+            echo "Auditing preview $base"
+            args+=(--base "$base") ;;
+          production)
+            if [ -n "$CHECK" ]; then
+              python3 -I "$ENGINE" preview --repo "$REPO" --sha "$HEAD_SHA" --check "$CHECK" --timeout "$TIMEOUT" --wait-only
+            fi ;;
+          artifact) args+=(--dist "$DIST") ;;
+        esac
+        python3 -I "$ENGINE" "${args[@]}"
