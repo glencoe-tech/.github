@@ -9,7 +9,7 @@ description: >-
 # A composite action: the engine that runs is exactly the one at the SHA the caller pinned, read
 # from $GITHUB_ACTION_PATH. Standard-library Python 3.11+ (preinstalled on GitHub-hosted runners).
 # Inputs reach the script through env, never spliced into the shell. It needs `checks: read` to
-# see the deploy check, and nothing else.
+# see the deploy check; with `indexnow-key` set, also `actions: read` to find the previous ledger.
 
 inputs:
   canonical:
@@ -45,9 +45,17 @@ inputs:
     required: false
     default: "900"
   token:
-    description: Token that can read check runs on this repository.
+    description: Token that can read check runs on this repository (and, for IndexNow, its artifacts).
     required: false
     default: ${{ github.token }}
+  indexnow-key:
+    description: >-
+      The site's IndexNow key (public by design; the site serves it at /<key>.txt). Empty: no
+      IndexNow. Submits only on a push to the default branch, only after the deploy check succeeded,
+      and only canonical, indexable URLs whose content changed since IndexNow last accepted them. The
+      first run records a baseline and submits nothing. The ledger is kept as a 90-day artifact.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -87,7 +95,49 @@ runs:
           production)
             if [ -n "$CHECK" ]; then
               python3 -I "$ENGINE" preview --repo "$REPO" --sha "$HEAD_SHA" --check "$CHECK" --timeout "$TIMEOUT" --wait-only
+              touch "$RUNNER_TEMP/seo-standard-deployed"  # the deploy check succeeded for this commit
             fi ;;
           artifact) args+=(--dist "$DIST") ;;
         esac
         python3 -I "$ENGINE" "${args[@]}"
+
+    # IndexNow runs even when the audit found problems: it submits only URLs that are eligible on
+    # their own. It never runs without a deploy that succeeded, and a refusal never fails the job.
+    - name: IndexNow (changed canonical URLs, after the deploy)
+      id: indexnow
+      if: ${{ always() && inputs.indexnow-key != '' }}
+      shell: bash
+      env:
+        ENGINE: ${{ github.action_path }}/seo_standard.py
+        CANONICAL: ${{ inputs.canonical }}
+        SITEMAPS: ${{ inputs.sitemaps }}
+        KEY: ${{ inputs.indexnow-key }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        EVENT: ${{ github.event_name }}
+        REF: ${{ github.ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        REPO: ${{ github.repository }}
+        SHA: ${{ github.sha }}
+      run: |
+        set -uo pipefail
+        if [ "$EVENT" != push ] || [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ] || [ ! -f "$RUNNER_TEMP/seo-standard-deployed" ]; then
+          echo "IndexNow: not a successful production deploy of the default branch; nothing submitted"
+          exit 0
+        fi
+        mkdir -p "$RUNNER_TEMP/seo-standard-ledger"
+        args=(indexnow --canonical "$CANONICAL" --key "$KEY" --repo "$REPO" --sha "$SHA"
+              --ledger-out "$RUNNER_TEMP/seo-standard-ledger/ledger.json" --md "$GITHUB_STEP_SUMMARY")
+        for s in $SITEMAPS; do args+=(--sitemap "$s"); done
+        if python3 -I "$ENGINE" "${args[@]}"; then
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::IndexNow could not run; see the log. Nothing was recorded."
+        fi
+
+    - name: Keep the IndexNow ledger
+      if: ${{ always() && steps.indexnow.outputs.ran == 'true' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: seo-standard-indexnow-ledger
+        path: ${{ runner.temp }}/seo-standard-ledger/ledger.json
+        retention-days: 90

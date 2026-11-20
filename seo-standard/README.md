@@ -94,6 +94,31 @@ their own.
 **Info:** no structured data; which training crawlers (`GPTBot`, `Google-Extended`, `CCBot`, …)
 are blocked. Blocking those is a legitimate choice for each client.
 
+## IndexNow (after a production deploy)
+
+Set `indexnow-key` to tell IndexNow (Bing, Yandex, Seznam, Naver and others) which pages changed.
+The site must serve the key at `https://<host>/<key>.txt`. The key is public by design and is not
+a credential. Give the job `actions: read` as well as `checks: read`.
+
+- **When:** only on a push to the default branch, and only after the deploy check succeeded for
+  that commit. A failed or skipped deploy submits nothing. Pull requests and previews never submit.
+- **What:** only eligible URLs from the sitemap. An eligible URL is on the production host over
+  https, has no `#fragment`, is allowed for Bingbot, answers 200, is not `noindex` for Bingbot, and
+  names itself (or nothing) as canonical. Preview, staging, private and noindex routes are excluded
+  by construction.
+- **Changed only:** each URL gets a fingerprint of what a reader sees (title, description,
+  canonical, visible text, JSON-LD). A URL is submitted only when its fingerprint differs from the
+  one IndexNow last accepted. A rebuild that changes only markup or asset hashes submits nothing.
+  The first run records a baseline and submits nothing.
+- **Limits and retries:** at most 10,000 URLs per request and 1,000 pages per run. A 429 or 5xx
+  is retried with backoff, honouring `Retry-After`. A refused change is retried on the next deploys,
+  at most 5 times, until the page changes again.
+- **Records:** the ledger (fingerprints plus the last 200 submissions, with status codes and notes)
+  is kept as the `seo-standard-indexnow-ledger` artifact for 90 days. Each run reads the newest one.
+  A ledger that expired means the next run records a new baseline. The job summary shows each run.
+- **Not proof of indexing:** "accepted" means IndexNow received the URLs, nothing more. Coverage
+  comes from Search Console and Bing Webmaster Tools.
+
 ## Previews
 
 The deploy check tells the action where the preview is:

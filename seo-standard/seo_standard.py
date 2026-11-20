@@ -22,7 +22,10 @@ glencoe-infra's Search Console monitor.
 from __future__ import annotations
 
 import argparse
+import datetime
+import hashlib
 import html.parser
+import io
 import json
 import os
 import re
@@ -30,6 +33,7 @@ import sys
 import time
 import urllib.error
 import urllib.parse
+import zipfile
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -56,6 +60,13 @@ HIDDEN_ELEMENTS = {"script", "style", "noscript", "template", "svg"}
 HEAD_ELEMENTS = {"head", "title", "meta", "link", "script", "style", "base", "noscript", "template"}
 SOFT_404_PATH = "/glencoe-seo-standard-missing-page-probe"
 ROBOTS_REDIRECTS = 5  # RFC 9309 2.3.1.2: follow at least five consecutive redirects
+INDEXNOW_ENDPOINT = "https://api.indexnow.org/indexnow"
+INDEXNOW_BATCH = 10_000      # the protocol's limit per request
+INDEXNOW_PAGES = 1_000       # sitemap URLs fetched and fingerprinted per run
+INDEXNOW_ATTEMPTS = 5        # runs a refused change is retried before it waits for the next change
+INDEXNOW_ACCEPTED = (200, 202)
+LEDGER_LOG = 200             # submission records kept in the ledger
+LEDGER_ARTIFACT = "seo-standard-indexnow-ledger"
 UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
 
@@ -112,9 +123,10 @@ class Http:
         hdrs = {"User-Agent": USER_AGENT, **(headers or {})}
         last: Exception | None = None
         resp = None
+        wait = 0.0
         for n in range(self.attempts):
             if n:
-                self.sleep(min(2 ** n, 30))
+                self.sleep(min(max(2 ** n, wait), 60))
             try:
                 resp = self.send(urllib.request.Request(url, data=body, headers=hdrs, method=method), self.timeout)
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
@@ -122,6 +134,8 @@ class Http:
                 continue
             if resp.status not in RETRY_STATUS:
                 return resp
+            retry_after = resp.header("retry-after").strip()
+            wait = float(retry_after) if retry_after.isdigit() else 0.0
             last = None
         if resp is None:
             raise ConnectionError(f"{method} {url}: {last}")
@@ -152,6 +166,7 @@ class Page(html.parser.HTMLParser):
         self.meta: dict[str, str] = {}
         self.jsonld: list[str] = []
         self.words = self.h1 = 0
+        self.text: list[str] = []
         self._in_title = self._in_ld = self._in_head = False
         self._hidden = 0
         self.feed(text)
@@ -200,6 +215,7 @@ class Page(html.parser.HTMLParser):
         elif not self._hidden and data.strip():
             self._in_head = False  # text cannot sit in <head>
             self.words += len(data.split())
+            self.text.append(" ".join(data.split()))
 
 
 def noindex(directives: str) -> bool:
@@ -600,6 +616,154 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
     return {"findings": out, "facts": facts}
 
 
+# --- IndexNow: changed canonical URLs, after a production deploy --------------------------------
+
+def fingerprint(page: "Page") -> str:
+    """What a search engine would re-read: title, description, canonical, visible text, JSON-LD.
+    Markup, scripts and asset hashes do not count, so a rebuild that changes nothing a reader sees
+    changes nothing here."""
+    h = hashlib.sha256()
+    for part in (page.title.strip(), page.meta.get("description", "").strip(), page.canonical.strip(),
+                 " ".join(page.text), *[b.strip() for b in page.jsonld]):
+        h.update(part.encode("utf-8") + b"\0")
+    return h.hexdigest()
+
+
+def eligible(http: Http, canonical: str, sitemaps: list[str], notes: list[str]) -> dict[str, str] | None:
+    """{url: fingerprint} for every sitemap URL a search engine should index: on the production
+    host over https, no #fragment, allowed for Bingbot, answering 200, not noindex, and naming
+    itself (or nothing) as canonical. None when robots.txt cannot be read (submit nothing)."""
+    src = Live(http, canonical)
+    rr = _fetch_robots(src, f"https://{host(canonical)}/robots.txt", [])
+    if rr.status in (404, 410):
+        robots = ""
+    elif rr.status != 200 or looks_html(rr.body):
+        notes.append(f"robots.txt answered {rr.status}: crawlers would fetch nothing, so nothing is submitted")
+        return None
+    else:
+        robots = rr.text()
+    urls: list[str] = []
+    for m in sitemaps:
+        urls += read_sitemap(src, m, [])
+    pages: dict[str, str] = {}
+    for u in dict.fromkeys(urls):
+        if len(pages) >= INDEXNOW_PAGES:
+            notes.append(f"only the first {INDEXNOW_PAGES} eligible URLs were fingerprinted")
+            break
+        parts = urllib.parse.urlsplit(u)
+        if parts.scheme != "https" or host(u) != host(canonical) or parts.fragment:
+            continue
+        if not allowed(robots, "bingbot", (parts.path or "/") + (f"?{parts.query}" if parts.query else "")):
+            continue
+        r = src.get(u)
+        if r.status != 200:
+            continue
+        page = Page(r.text())
+        if header_noindex(r.header("x-robots-tag"), ("bingbot",)) or noindex(page.robots):
+            continue
+        if page.canonical and norm(urllib.parse.urljoin(u, page.canonical)) != norm(u):
+            continue
+        pages[u] = fingerprint(page)
+    return pages
+
+
+def indexnow(canonical: str, sitemaps: list[str], key: str, ledger: dict | None, http: Http,
+             sha: str = "", now: str | None = None, dry_run: bool = False) -> tuple[dict, dict]:
+    """(new ledger, this run's record). Submits only eligible URLs whose fingerprint differs from
+    the one IndexNow last accepted. With no ledger, the run records a baseline and submits nothing:
+    a first run never re-announces a whole site. 'accepted' means IndexNow took the URLs; it is
+    never proof that anything was crawled or indexed."""
+    now = now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    h = host(canonical)
+    record: dict = {"time": now, "sha": sha, "host": h, "submitted": 0, "accepted": 0, "failed": 0,
+                    "status": [], "notes": [], "dry_run": dry_run}
+    old = ledger if ledger and ledger.get("version") == 1 and ledger.get("host") == h else None
+    new = {"version": 1, "host": h, "urls": dict((old or {}).get("urls", {})), "log": list((old or {}).get("log", []))}
+
+    def done() -> tuple[dict, dict]:
+        new["log"] = (new["log"] + [record])[-LEDGER_LOG:]
+        return new, record
+
+    key_file = http.get(f"https://{h}/{key}.txt")
+    if key_file.status != 200 or key_file.text().strip() != key:
+        record["notes"].append(f"https://{h}/{key}.txt answered {key_file.status} without the key: nothing submitted")
+        return done()
+    pages = eligible(http, canonical, sitemaps, record["notes"])
+    if pages is None:
+        return done()
+    for u in [u for u in new["urls"] if u not in pages]:
+        del new["urls"][u]  # no longer eligible: forget it, so a return counts as a change
+    if old is None:
+        new["urls"] = {u: {"fingerprint": fp, "accepted": fp, "attempts": 0} for u, fp in pages.items()}
+        record["notes"].append(f"baseline: {len(pages)} eligible URLs recorded, nothing submitted")
+        return done()
+    changed = []
+    for u, fp in pages.items():
+        entry = new["urls"].setdefault(u, {"fingerprint": fp, "accepted": "", "attempts": 0})
+        if entry["fingerprint"] != fp:
+            entry["fingerprint"], entry["attempts"] = fp, 0
+        if entry["accepted"] != fp and entry["attempts"] < INDEXNOW_ATTEMPTS:
+            changed.append(u)
+    if dry_run:
+        record["notes"].append(f"dry run: {len(changed)} changed URLs would be submitted")
+        record["would_submit"] = changed
+        return done()
+    for i in range(0, len(changed), INDEXNOW_BATCH):
+        batch = changed[i:i + INDEXNOW_BATCH]
+        body = json.dumps({"host": h, "key": key, "keyLocation": f"https://{h}/{key}.txt", "urlList": batch}).encode()
+        try:
+            r = http.request("POST", INDEXNOW_ENDPOINT, {"Content-Type": "application/json; charset=utf-8"}, body)
+            status = r.status
+        except ConnectionError:
+            status = 0
+        record["submitted"] += len(batch)
+        record["status"].append(status)
+        for u in batch:
+            entry = new["urls"][u]
+            if status in INDEXNOW_ACCEPTED:
+                entry["accepted"], entry["attempts"], entry["accepted_at"] = entry["fingerprint"], 0, now
+            else:
+                entry["attempts"] += 1
+        if status in INDEXNOW_ACCEPTED:
+            record["accepted"] += len(batch)
+        else:
+            record["failed"] += len(batch)
+    if not changed:
+        record["notes"].append("no eligible URL changed since IndexNow last accepted it")
+    return done()
+
+
+def fetch_ledger(http: Http, repo: str, token: str) -> dict | None:
+    """The newest unexpired ledger artifact from this repository's earlier runs, or None."""
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={LEDGER_ARTIFACT}&per_page=20", hdrs)
+    if r.status != 200:
+        return None
+    live = [a for a in json.loads(r.body).get("artifacts", []) if not a.get("expired")]
+    if not live:
+        return None
+    newest = max(live, key=lambda a: a.get("created_at", ""))
+    z = http.get(newest["archive_download_url"], hdrs)
+    while z.status in REDIRECTS and z.header("location"):
+        z = http.get(z.header("location"))  # the archive itself is served from signed storage
+    if z.status != 200:
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(z.body)) as archive:
+            return json.loads(archive.read("ledger.json"))
+    except (zipfile.BadZipFile, KeyError, ValueError):
+        return None
+
+
+def indexnow_markdown(record: dict) -> str:
+    lines = [f"### IndexNow: {record['host']}", ""]
+    lines.append(f"{record['submitted']} changed URLs submitted, {record['accepted']} accepted, {record['failed']} refused"
+                 + (f" (HTTP {', '.join(map(str, record['status']))})" if record["status"] else "") + ".")
+    lines += [f"- {n}" for n in record["notes"]]
+    lines += ["", "_Accepted means IndexNow received the URLs. It is not proof of crawling or indexing._", ""]
+    return "\n".join(lines) + "\n"
+
+
 # --- preview resolution --------------------------------------------------------------------------
 
 PAGES_PREVIEW = re.compile(r"Preview URL:.*?href=['\"](https://[^'\"]+)['\"]", re.S)
@@ -694,8 +858,47 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
     p.add_argument("--workers-subdomain", default="", help="the account's workers.dev subdomain")
     p.add_argument("--timeout", type=float, default=900)
     p.add_argument("--wait-only", action="store_true", help="only wait for the check to succeed")
+    n = sub.add_parser("indexnow")
+    n.add_argument("--canonical", required=True)
+    n.add_argument("--sitemap", action="append", default=[])
+    n.add_argument("--key", required=True, help="the site's IndexNow key, hosted at /<key>.txt")
+    n.add_argument("--ledger-out", required=True, help="write the new ledger here")
+    n.add_argument("--ledger-in", help="the previous ledger (JSON); omit to fetch it from this repo's artifacts")
+    n.add_argument("--repo", default="", help="owner/name, to fetch the previous ledger artifact")
+    n.add_argument("--sha", default="")
+    n.add_argument("--md", help="append the record as markdown here")
+    n.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
     http = http or Http()
+
+    if args.command == "indexnow":
+        if not args.canonical.startswith("https://") or not args.sitemap or \
+                not re.fullmatch(r"[A-Za-z0-9-]{8,128}", args.key):
+            print("indexnow: needs an https --canonical, a --sitemap and an 8-128 character [A-Za-z0-9-] --key",
+                  file=sys.stderr)
+            return 2
+        if args.ledger_in:
+            try:
+                with open(args.ledger_in, encoding="utf-8") as f:
+                    ledger = json.load(f)
+            except (OSError, ValueError):
+                ledger = None
+        else:
+            ledger = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", "")) if args.repo else None
+        try:
+            new, record = indexnow(args.canonical, args.sitemap, args.key, ledger, http, args.sha, dry_run=args.dry_run)
+        except ConnectionError as e:
+            print(f"indexnow: unreachable: {e}", file=sys.stderr)
+            return 2
+        with open(args.ledger_out, "w", encoding="utf-8") as f:
+            json.dump(new, f, indent=2, sort_keys=True)
+        report = indexnow_markdown(record)
+        if args.md:
+            with open(args.md, "a", encoding="utf-8") as f:
+                f.write(report)
+        else:
+            sys.stdout.write(report)
+        return 0
 
     if args.command == "preview":
         try:
