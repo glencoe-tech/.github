@@ -62,7 +62,8 @@ their own.
   - Redirects are followed for up to 5 hops.
 - `robots.txt` or a sitemap whose body is an HTML page (the SPA fallback)
 - a sitemap that is missing, invalid XML, not a sitemap, or lists URLs on another host
-- a sampled sitemap URL that is:
+- a sampled sitemap URL (up to 20 in production and artifact mode, 5 in preview, spread evenly
+  across the whole sitemap with the first and last always included) that is:
   - not a 200 (redirects count)
   - `noindex`
   - disallowed by robots.txt for Googlebot or Bingbot
@@ -82,6 +83,15 @@ their own.
 - an AI search crawler blocked (`OAI-SearchBot`, `PerplexityBot`, `Claude-SearchBot`, …)
 - an empty sitemap
 - an edge bot challenge
+- `served-content-empty`: the homepage or a sampled page serves fewer than 50 words and no `<h1>`
+  without JavaScript. `<noscript>` content counts, because a crawler without JavaScript reads it;
+  `<script>`, `<style>`, `<template>` and `<svg>` do not, and inline markup does not split words.
+  Google renders JavaScript, but most AI-search crawlers do not, so a client-rendered page is empty
+  to them. Prerender it. A short page under a server-rendered `<h1>`, such as a form, passes. This
+  stays a warning while the sites it flags today are remediated.
+- `soft-404` (production): a URL that does not exist answers 200.
+- `sitemap-url-fragment`: sitemap URLs with a `#fragment`. Crawlers drop the fragment, so each one
+  duplicates the page without it, and they are not sampled.
 
 **Info:** no structured data; which training crawlers (`GPTBot`, `Google-Extended`, `CCBot`, …)
 are blocked. Blocking those is a legitimate choice for each client.

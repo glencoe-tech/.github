@@ -37,7 +37,23 @@ USER_AGENT = "Mozilla/5.0 (compatible; Glencoe-SEO-Standard/1.0; +https://glenco
 SM = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
 RETRY_STATUS = {429, 500, 502, 503, 504}
 REDIRECTS = (301, 302, 303, 307, 308)
-SAMPLE_URLS = 5
+# Sitemap URLs fetched per audit, spread evenly across the whole sitemap (first and last always
+# included). A preview is fetched over the network on every pull request, so it samples fewer.
+SAMPLE_URLS = {"production": 20, "artifact": 20, "preview": 5}
+# Served content: what a crawler that does not run JavaScript reads. Most AI-search crawlers do
+# not run it, so a client-rendered page (a shell with a handful of words and no <h1>) is empty to
+# them even when Google renders it. 50 words separates a shell from a real page without judging
+# length; a short page under a server-rendered <h1> (a form) passes.
+SERVED_WORDS = 50
+# Not served text. <noscript> is: a crawler that does not run JavaScript reads it.
+HIDDEN_ELEMENTS = {"script", "style", "template", "svg"}
+# Elements that separate words; inline elements (<span>, <a>, <b>) do not, so "wo<span>rd</span>"
+# is one word, as a reader sees it.
+BLOCK_ELEMENTS = {"address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "fieldset",
+                  "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr",
+                  "li", "main", "nav", "ol", "p", "pre", "section", "table", "td", "th", "tr", "ul", "body"}
+HEAD_ELEMENTS = {"head", "title", "meta", "link", "script", "style", "base", "noscript", "template"}
+SOFT_404_PATH = "/glencoe-seo-standard-missing-page-probe"
 CHILD_SITEMAPS = 10
 # Crawlers that put a site in search results, classic or AI. Blocking one hides the site from it.
 SEARCH_CRAWLERS = ("googlebot", "bingbot")
@@ -141,11 +157,27 @@ class Page(html.parser.HTMLParser):
         self.title, self.canonical, self.robots, self.viewport, self.base = "", "", "", False, ""
         self.meta: dict[str, str] = {}
         self.jsonld: list[str] = []
-        self._in_title = self._in_ld = False
+        self.h1 = 0
+        self._in_title = self._in_ld = self._in_head = False
+        self._hidden = 0
+        self._chunks: list[str] = []
         self.feed(text)
+        self.close()
+        self.text = " ".join("".join(self._chunks).split())  # the served text, as a reader sees it
+        self.words = len(self.text.split())
 
     def handle_starttag(self, tag, attrs):
         a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "head":
+            self._in_head = True
+        elif tag == "body" or tag not in HEAD_ELEMENTS:
+            self._in_head = False  # the head ends where browsers end it, even without </head>
+        if tag in HIDDEN_ELEMENTS:
+            self._hidden += 1
+        elif tag == "h1" and not self._hidden:
+            self.h1 += 1
+        if tag in BLOCK_ELEMENTS and not self._hidden:  # hidden subtrees add no word breaks either
+            self._chunks.append(" ")
         if tag == "title":
             self._in_title = True
         elif tag == "base" and a.get("href") and not self.base:
@@ -165,6 +197,12 @@ class Page(html.parser.HTMLParser):
             self.jsonld.append("")
 
     def handle_endtag(self, tag):
+        if tag == "head":
+            self._in_head = False
+        if tag in HIDDEN_ELEMENTS and self._hidden:
+            self._hidden -= 1
+        if tag in BLOCK_ELEMENTS and not self._hidden:
+            self._chunks.append(" ")
         if tag == "title":
             self._in_title = False
         elif tag == "script":
@@ -175,6 +213,11 @@ class Page(html.parser.HTMLParser):
             self.title += data
         elif self._in_ld:
             self.jsonld[-1] += data
+        elif not self._hidden:
+            if data.strip():
+                self._in_head = False  # text cannot sit in <head>
+            if not self._in_head:
+                self._chunks.append(data)
 
 
 def noindex(directives: str) -> bool:
@@ -419,6 +462,8 @@ def _homepage(r: Response, canonical: str, mode: str, out: list[dict], facts: di
         out.append(finding("warn", "open-graph-incomplete", "missing " + ", ".join(missing)))
     if not page.viewport:
         out.append(finding("warn", "no-viewport", "no meta viewport: not mobile-friendly"))
+    facts["served_words"] = page.words
+    _served(page, canonical, out)
     facts["structured_data"] = len(page.jsonld)
     if not page.jsonld:
         out.append(finding("info", "no-structured-data", "no JSON-LD on the homepage"))
@@ -463,8 +508,34 @@ def _robots(r: Response, mode: str, out: list[dict], facts: dict) -> str:
     return text
 
 
+def spread(urls: list[str], n: int) -> list[str]:
+    """n URLs spread evenly over the list, first and last included (all of them when n or fewer)."""
+    if len(urls) <= n:
+        return list(urls)
+    return [urls[round(i * (len(urls) - 1) / (n - 1))] for i in range(n)]
+
+
+def _served(page: "Page", url: str, out: list[dict]) -> None:
+    """One warning per page: the homepage is checked once even when the sample includes it."""
+    seen = {f.get("url") for f in out if f["code"] == "served-content-empty"}
+    if page.words < SERVED_WORDS and not page.h1 and norm(url) not in seen:
+        out.append({**finding("warn", "served-content-empty",
+                              f"{url} serves {page.words} words and no <h1> without JavaScript; most AI-search "
+                              "crawlers do not run it and see an empty page. Prerender it."), "url": norm(url)})
+
+
+def _soft_404(src, canonical: str, out: list[dict]) -> None:
+    probe = f"https://{host(canonical)}{SOFT_404_PATH}"
+    try:
+        r = src.get(probe)
+    except ConnectionError:
+        return
+    if r.status == 200:
+        out.append(finding("warn", "soft-404", f"{probe} does not exist but answers 200; missing pages must return 404"))
+
+
 def _sampled(src, mode: str, robots: str, urls: list[str], out: list[dict]) -> None:
-    for u in urls[:SAMPLE_URLS]:
+    for u in spread(urls, SAMPLE_URLS[mode]):
         p = urllib.parse.urlsplit(u)
         target = (p.path or "/") + (f"?{p.query}" if p.query else "")
         blocked_for = [a for a in SEARCH_CRAWLERS if robots and not allowed(robots, a, target)]
@@ -484,6 +555,7 @@ def _sampled(src, mode: str, robots: str, urls: list[str], out: list[dict]) -> N
         if page.canonical and norm(canonical_of(page, u)) != norm(u):
             out.append(finding("critical", "sitemap-url-canonical-elsewhere",
                                f"{u} declares rel=canonical {page.canonical}: list only canonical URLs"))
+        _served(page, u, out)
 
 
 def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mode: str = "production",
@@ -521,7 +593,14 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
         if off:
             out.append(finding("critical", "sitemap-off-host",
                                f"{len(off)} URLs not on https://{host(canonical)}, e.g. {off[0]}"))
-        _sampled(src, mode, robots, [u for u in urls if u not in off], out)
+        fragments = [u for u in urls if "#" in u]
+        if fragments:
+            out.append(finding("warn", "sitemap-url-fragment",
+                               f"{len(fragments)} sitemap URLs carry a #fragment, e.g. {fragments[0]}; crawlers drop "
+                               "it, so each is a duplicate of the page without it"))
+        _sampled(src, mode, robots, [u for u in urls if u not in off and "#" not in u], out)
+        if mode == "production":
+            _soft_404(src, canonical, out)
         if mode == "production":
             for h in private_hosts:
                 try:
