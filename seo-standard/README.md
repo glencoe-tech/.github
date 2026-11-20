@@ -106,7 +106,7 @@ a credential. In `seo.yml`, add to the snippet above:
 on:
   # ...pull_request and push as above, plus:
   schedule:
-    - cron: "41 5 * * 1"   # weekly: keeps the ledger from expiring, catches changes made outside a deploy
+    - cron: "41 5 * * 1"   # weekly: refreshes the ledger between deploys, catches changes made outside a deploy
 permissions:
   contents: read
   checks: read
@@ -149,8 +149,14 @@ and `indexnow-key: <key>` under `with:`.
     submits and records nothing and warns, so the last good ledger stays the newest.
   - It expired, or it is corrupt or invalid (including a bad timestamp): the run starts a new
     baseline, records why, and puts a `::warning::` on the run. URLs that changed since IndexNow
-    last accepted them are not submitted; the weekly schedule keeps this from happening.
+    last accepted them are not submitted. The reason stays in the ledger until a baseline
+    completes, so a run that ends early (the key not served, say) does not lose the warning.
   - There has never been one: the first baseline, which is planned and silent.
+  - The weekly schedule makes expiry unlikely, not impossible. GitHub can drop a scheduled run, and
+    it disables schedules in a public repository after 60 days without activity. The warning is
+    the backstop.
+  - Every page of the artifact listing is read, so a ledger behind newer artifacts from other
+    branches is still found.
 - **Not proof of indexing:** "accepted" means IndexNow received the URLs, nothing more. Coverage
   comes from Search Console and Bing Webmaster Tools.
 
