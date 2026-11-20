@@ -14,6 +14,7 @@ import tempfile
 import unittest
 import urllib.error
 import zipfile
+import zlib
 from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -783,8 +784,9 @@ class IndexNow(unittest.TestCase):
         with zipfile.ZipFile(good, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("ledger.json", json.dumps({"version": 1, "pad": "x" * 500}))
         raw = bytearray(good.getvalue())
-        start = 30 + len("ledger.json")  # the local header, then the deflate stream
-        raw[start:start + 40] = b"\xff" * 40
+        raw[30 + len("ledger.json")] = 0xFF  # the first byte of the deflate stream: an invalid block type
+        with self.assertRaises(zlib.error), zipfile.ZipFile(io.BytesIO(bytes(raw))) as z:
+            z.read("ledger.json")  # the fixture really is the zlib case, not a bad ZIP directory
         damaged = {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(200, bytes(raw))}
         self.assertEqual(seo.fetch_ledger(http(damaged)[0], "o/r", "tok", "main", name), ("unreadable", "unreadable"))
         # 100 newer artifacts from another branch on page 1 do not hide the default branch's on page 2.
