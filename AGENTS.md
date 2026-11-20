@@ -1,4 +1,5 @@
 <!-- ODG-UNIVERSAL-AGENT-STANDARD:START -->
+
 # Universal agent contract
 
 This contract applies to every automated engineering role in this repository: implementation,
@@ -32,6 +33,16 @@ Repository instructions may be stricter; they may not weaken that standard.
   accountable owner's explicit authorization for that event. A preview is safe only when no
   production secret reaches the job and it serves no production traffic. A missing target or an
   expected failure is not proof of safety.
+- **Deployment secrets live in GitHub.** When GitHub runs a deployment, every secret it needs
+  (runtime, build and the deploy credential) is a secret of the repository's GitHub environment for
+  that target; a production environment admits only the default branch. They change
+  only inside the deploy pipeline: for a Worker, sent with each release (`wrangler deploy
+  --secrets-file`, which adds and overwrites but never deletes) and removed by `wrangler versions secret
+  delete` between upload and deploy; a deploy-job step only for providers without that option (Pages
+  direct upload, Supabase).
+  Never `wrangler secret put` or `secret bulk` on a Worker, even in a pipeline: each deploys the last
+  uploaded version. No change by hand, no dashboard edit. Builds Cloudflare runs from git (Workers
+  Builds, Pages git builds, their previews) are exempt.
 - Preserve repository-specific architecture and conventions; standardize behavior, not filenames.
 - **Environment lifecycle is part of completion.** Use the declared Docker/container environment
   for dependency installation, builds, testing, and packaging. A necessary native/local fallback
@@ -48,4 +59,5 @@ Repository instructions may be stricter; they may not weaken that standard.
 
 Final responses use `RESULT: PASS | PARTIAL | BLOCKED | FAIL`, then concise `CHANGES`, `PROOF`,
 `DOCUMENTATION`, `ARCHITECTURE`, and `RISKS / REMAINING` sections.
+
 <!-- ODG-UNIVERSAL-AGENT-STANDARD:END -->
