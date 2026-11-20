@@ -27,9 +27,10 @@ An error means a crawler would index the wrong page, the wrong URL, or nothing a
 - `page-title`, `page-description`: missing.
 - `page-canonical`: not exactly one canonical link, or one that is not the sitemap URL.
   `https://x.com` and `https://x.com/` count as the same URL; nothing else is normalised.
-- `page-served-content`: fewer than 50 words of text in the served HTML. Google renders
-  JavaScript; most AI-search crawlers do not, so a client-rendered page is empty to them.
-  Prerender it.
+- `page-served-content`: fewer than 50 words of text and no `<h1>` in the served HTML, so the
+  page is rendered by JavaScript. Google renders JavaScript; most AI-search crawlers do not, so
+  such a page is empty to them. Prerender it. (Under 50 words beneath a server-rendered `<h1>`,
+  such as a form page, is the `page-thin-content` warning.)
 - `structured-data`: a JSON-LD block that does not parse or has no `@type`.
 - `soft-404` (live): a URL that does not exist answers 200, so every mistyped URL is an
   indexable duplicate of the app shell.
@@ -38,8 +39,8 @@ An error means a crawler would index the wrong page, the wrong URL, or nothing a
 
 ## Warnings (reported, never fail)
 
-Title over 65 or description over 170 characters, no `lang`, not exactly one `<h1>`, missing
-Open Graph tags, no JSON-LD on the home page, invalid `lastmod`, no `Sitemap:` line in
+Title over 65 or description over 170 characters, a short page (`page-thin-content`), no `lang`,
+not exactly one `<h1>`, missing Open Graph tags, no JSON-LD on the home page, invalid `lastmod`, no `Sitemap:` line in
 `robots.txt`, plain HTTP not redirecting to HTTPS (live), an indexable built page missing from the
 sitemap (static), and more than 500 sitemap URLs (only the first 500 are checked).
 

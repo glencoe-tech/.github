@@ -49,8 +49,9 @@ TRAINING_AGENTS = ("GPTBot", "ClaudeBot", "Google-Extended", "CCBot", "Applebot-
 
 SITEMAP_NS = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
 # Text a page needs in its served HTML before a crawler that does not run JavaScript sees content.
-# A client-rendered shell carries a handful of words (a title, a noscript line); a real page
-# carries hundreds. 50 separates the two without judging how long a page ought to be.
+# A client-rendered shell carries a handful of words (a title, a noscript line) and no <h1>; a
+# real page carries hundreds. Fewer than 50 words AND no <h1> is a shell (an error); fewer than 50
+# words under a server-rendered <h1> is a deliberately short page, such as a form (a warning).
 MIN_WORDS = 50
 HIDDEN_TAGS = frozenset({"head", "script", "style", "noscript", "template", "svg"})
 SOFT_404_PATH = "/glencoe-discoverability-missing-page-probe"
@@ -401,13 +402,15 @@ def check_page(report: Report, url: str, resp: Response, origin: str, home: bool
         report.error("page-canonical", url, f"{len(page.canonicals)} canonical links, expected exactly 1")
     elif not same_url(page.canonicals[0], url):
         report.error("page-canonical", url, f"canonical {page.canonicals[0]} is not the sitemap URL")
-    if page.words < MIN_WORDS:
+    if page.words < MIN_WORDS and page.h1 == 0:
         report.error(
             "page-served-content",
             url,
-            f"served HTML holds {page.words} words of text; crawlers that do not run JavaScript "
-            "(most AI search crawlers) see an empty page. Prerender it.",
+            f"served HTML holds {page.words} words and no <h1>: the page is rendered by JavaScript, "
+            "and crawlers that do not run it (most AI search crawlers) see an empty page. Prerender it.",
         )
+    elif page.words < MIN_WORDS:
+        report.warn("page-thin-content", url, f"served HTML holds {page.words} words of text")
     if not page.lang:
         report.warn("page-lang", url, "<html> has no lang attribute")
     if page.h1 != 1:

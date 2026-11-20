@@ -245,10 +245,12 @@ class PageTests(unittest.TestCase):
         self.assertFalse(d.same_url("https://e.com/a", "https://e.com/a/"))
 
     def test_served_content(self):
-        thin = self.check(page(ORIGIN + "/about", body="Loading"))
-        self.assertEqual(rules(thin), ["page-served-content"])
-        hidden = page(ORIGIN + "/about", body="<noscript>" + WORDS + "</noscript><template>" + WORDS + "</template>")
+        shell = self.check(page(ORIGIN + "/about", body="Loading", h1=0))
+        self.assertEqual(rules(shell), ["page-served-content"])
+        hidden = page(ORIGIN + "/about", h1=0, body="<noscript>" + WORDS + "</noscript><template>" + WORDS + "</template>")
         self.assertEqual(rules(self.check(hidden)), ["page-served-content"])
+        short = self.check(page(ORIGIN + "/about", body="Get a quote in three steps."))
+        self.assertEqual((short.errors, rules(short, "warning")), (0, ["page-thin-content"]))
         stray_close = page(ORIGIN + "/about").replace("<p>", "</noscript><p>")
         self.assertEqual(self.check(stray_close).findings, [])
 
