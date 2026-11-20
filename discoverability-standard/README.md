@@ -13,36 +13,51 @@ It reads only what the site serves, never its content choices, and has three com
 
 An error means a crawler would index the wrong page, the wrong URL, or nothing at all.
 
-- `robots-present`: no `robots.txt`.
-- `search-crawler-allowed`: `robots.txt` blocks a crawler that puts the site into search results
-  or AI answers: Googlebot, Bingbot, OAI-SearchBot, ChatGPT-User, PerplexityBot, Claude-SearchBot,
+- `robots-present`: `robots.txt` answers 5xx or not at all, which crawlers read as "the whole site
+  is disallowed" (RFC 9309). A 4xx means "everything allowed" and is only a warning.
+- `search-crawler-allowed`: `robots.txt` blocks, from any sitemap URL, a crawler that puts the site
+  into search results or AI answers: Googlebot, Bingbot, OAI-SearchBot, ChatGPT-User, PerplexityBot, Claude-SearchBot,
   Claude-User. Training crawlers (GPTBot, ClaudeBot, Google-Extended, CCBot, Applebot-Extended)
-  are a site-owner policy choice; the check reports them and never fails on them.
-- `sitemap-present`, `sitemap-xml`, `sitemap-empty`, `sitemap-depth`: no sitemap, an app's HTML
-  fallback served where the sitemap should be, invalid XML, or an index that lists another index.
+  are a site-owner policy choice; the check reports them and never fails on them. Rules follow
+  RFC 9309 and Google: the crawler's own group (or the longest group token it starts with, else
+  `*`), `*` and `$` wildcards, the longest matching rule wins (a trailing `*` adds nothing), Allow
+  wins a tie.
+- `sitemap-present`, `sitemap-xml`, `sitemap-size`, `sitemap-empty`, `sitemap-depth`: no sitemap,
+  an app's HTML fallback served where the sitemap should be, invalid XML or a DOCTYPE, over the
+  50 MB protocol limit (gzip sitemaps are read), no URLs, or an index that lists another index.
 - `sitemap-origin`, `sitemap-clean-url`, `sitemap-duplicate`: a sitemap URL on another origin,
-  with a query or `#fragment`, or listed twice.
+  with a `#fragment`, or listed twice. Query strings are valid.
 - `page-status`: a sitemap URL that does not answer 200 (a redirect counts; list the final URL).
-- `page-indexable`: `noindex` (meta or `X-Robots-Tag`) on a URL the sitemap asks to index.
+- `page-indexable`: `noindex` or `none` addressed to a search crawler (meta `robots`, `googlebot`,
+  `bingbot`...; or any `X-Robots-Tag` value, every repeated header read) on a URL the sitemap asks
+  to index. A directive scoped to another crawler (`GPTBot: noindex`) does not count.
 - `page-title`, `page-description`: missing.
 - `page-canonical`: not exactly one canonical link, or one that is not the sitemap URL.
-  `https://x.com` and `https://x.com/` count as the same URL; nothing else is normalised.
+  The canonical is resolved against `<base>` and the page URL; scheme and host case, the default
+  port and an empty path (`https://x.com` = `https://x.com/`) are normalised; path and query must
+  match exactly.
 - `page-served-content`: fewer than 50 words of text and no `<h1>` in the served HTML, so the
   page is rendered by JavaScript. Google renders JavaScript; most AI-search crawlers do not, so
   such a page is empty to them. Prerender it. (Under 50 words beneath a server-rendered `<h1>`,
   such as a form page, is the `page-thin-content` warning.)
-- `structured-data`: a JSON-LD block that does not parse or has no `@type`.
+- `structured-data`: a JSON-LD block that does not parse or has no `@type` (malformed `@graph`
+  shapes are ignored, never a crash).
 - `soft-404` (live): a URL that does not exist answers 200, so every mistyped URL is an
   indexable duplicate of the app shell.
 - `indexnow-key`, `indexnow-submit` (indexnow): the key file `https://<host>/<key>.txt` does not
-  hold the key, or IndexNow refused the submission.
+  hold the key, or IndexNow refused a batch (URLs go in batches of 10,000, the protocol limit).
 
 ## Warnings (reported, never fail)
 
 Title over 65 or description over 170 characters, a short page (`page-thin-content`), no `lang`,
 not exactly one `<h1>`, missing Open Graph tags, no JSON-LD on the home page, invalid `lastmod`, no `Sitemap:` line in
 `robots.txt`, plain HTTP not redirecting to HTTPS (live), an indexable built page missing from the
-sitemap (static), and more than 500 sitemap URLs (only the first 500 are checked).
+sitemap (static), a page over 10 MB (`page-size`; only its start is read), and more than 500
+sitemap URLs (only the first 500 are checked). `lastmod` must be a W3C datetime: `YYYY`,
+`YYYY-MM`, `YYYY-MM-DD`, or a date with a time and a zone.
+
+HTML is read as a crawler that does not run JavaScript reads it: `<template>` content is inert, and
+the head ends where browsers end it even without `</head>`.
 
 ## Use
 

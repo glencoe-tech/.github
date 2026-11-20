@@ -68,7 +68,7 @@ class FakeSource:
         for url, value in pages.items():
             self.pages[url] = value if isinstance(value, d.Response) else d.Response(200, {}, value)
 
-    def get(self, url, user_agent=d.USER_AGENT):
+    def get(self, url, limit=d.PAGE_LIMIT_BYTES):
         return self.pages.get(url, d.Response(404, {}, ""))
 
 
@@ -113,7 +113,7 @@ class RobotsTests(unittest.TestCase):
         self.assertTrue(d.root_allowed(groups, "GPTBot"))  # Allow wins a tie
         self.assertTrue(d.root_allowed(groups, "ClaudeBot"))  # in either order
         self.assertTrue(d.root_allowed(groups, "Bingbot"))  # /private does not match /
-        self.assertFalse(d.root_allowed(groups, "CCBot"))  # longer /* beats /
+        self.assertTrue(d.root_allowed(groups, "CCBot"))  # /* equals / (a trailing * adds nothing); Allow wins
         self.assertFalse(d.root_allowed(groups, "PerplexityBot"))  # falls back to *
         self.assertTrue(d.root_allowed({}, "anything"))
 
@@ -129,7 +129,8 @@ class RobotsTests(unittest.TestCase):
         site = healthy_site()
         del site.pages[ORIGIN + "/robots.txt"]
         report = d.cmd_live(argparse.Namespace(url=ORIGIN), site)
-        self.assertEqual(rules(report), ["robots-present"])
+        # RFC 9309: a 4xx robots.txt allows everything, so it is a warning, not an error.
+        self.assertEqual((rules(report), rules(report, "warning")), ([], ["robots-present"]))
         self.assertEqual(report.pages, 2)  # falls back to /sitemap.xml
 
     def test_robots_without_sitemap_line(self):
@@ -171,9 +172,9 @@ class SitemapTests(unittest.TestCase):
 
     def test_bad_urls(self):
         body = urlset("https://other.com/x", "", ORIGIN + "/?q=1", ORIGIN + "/#a", ORIGIN + "/", ORIGIN + "/")
-        report = self.live(**{ORIGIN + "/sitemap.xml": body})
+        report = self.live(**{ORIGIN + "/sitemap.xml": body, ORIGIN + "/?q=1": page(ORIGIN + "/?q=1")})
         self.assertEqual(rules(report), ["sitemap-clean-url", "sitemap-duplicate", "sitemap-origin"])
-        self.assertEqual(report.pages, 1)
+        self.assertEqual(report.pages, 2)  # a query string is a valid sitemap URL
 
     def test_lastmod_validation(self):
         good = self.live(**{ORIGIN + "/sitemap.xml": urlset(ORIGIN + "/", lastmod="2026-11-19")})
@@ -401,6 +402,131 @@ class IndexNowTests(unittest.TestCase):
                 d.cmd_indexnow(self.args(key=bad), healthy_site())
 
 
+class ReviewRegressionTests(unittest.TestCase):
+    """One test per defect found in independent review of glencoe-tech/.github#28 (e0a60f2)."""
+
+    def live(self, **pages):
+        return d.cmd_live(argparse.Namespace(url=ORIGIN), healthy_site(**pages))
+
+    def check(self, html=None, resp=None, url=ORIGIN + "/about"):
+        report = d.Report(mode="live", target=ORIGIN)
+        d.check_page(report, url, resp or d.Response(200, {}, html), ORIGIN, False)
+        return report
+
+    def test_robots_is_applied_to_every_sitemap_url(self):
+        report = self.live(**{ORIGIN + "/robots.txt": ROBOTS + "Disallow: /about\n"})
+        self.assertEqual(rules(report), ["search-crawler-allowed"])
+        self.assertEqual(report.findings[0].url, ORIGIN + "/about")
+
+    def test_robots_wildcards_anchors_and_queries(self):
+        groups, _ = d.parse_robots(
+            "User-agent: *\nDisallow: /*.pdf$\nDisallow: /search?\nAllow: /fish*\nDisallow: /fish\n"
+        )
+        everything, _ = d.parse_robots("User-agent: *\nDisallow: /**$\n")
+        self.assertFalse(d.path_allowed(everything, "Bingbot", "/"))  # /**$ matches "/" (and every path)
+        self.assertTrue(d.path_allowed(groups, "Bingbot", "/"))
+        self.assertFalse(d.path_allowed(groups, "Bingbot", "/files/a.pdf"))
+        self.assertTrue(d.path_allowed(groups, "Bingbot", "/files/a.pdf?x=1"))  # $ anchors the end
+        self.assertFalse(d.path_allowed(groups, "Bingbot", "/search?q=1"))
+        self.assertTrue(d.path_allowed(groups, "Bingbot", "/fishing"))  # /fish* equals /fish; Allow wins
+        self.assertTrue(d.path_allowed(groups, "Bingbot", "/robots.txt"))
+        report = d.Report(mode="live", target=ORIGIN)
+        d.check_crawlable(report, groups, ORIGIN + "/search?q=1")
+        self.assertEqual(rules(report), ["search-crawler-allowed"])
+
+    def test_group_selection_by_product_token(self):
+        groups, _ = d.parse_robots("User-agent: *\nDisallow: /\nUser-agent: googlebot\nAllow: /\n")
+        self.assertTrue(d.path_allowed(groups, "Googlebot-News", "/"))  # falls back to googlebot
+        self.assertFalse(d.path_allowed(groups, "Bingbot", "/"))
+
+    def test_unreachable_or_html_robots(self):
+        down = self.live(**{ORIGIN + "/robots.txt": d.Response(503)})
+        self.assertIn("robots-present", rules(down))
+        self.assertIn("search-crawler-allowed", rules(down))  # 5xx: the whole site is disallowed
+        html = self.live(**{ORIGIN + "/robots.txt": "<!doctype html><html></html>"})
+        self.assertEqual(rules(html), [])
+        self.assertIn("robots-present", rules(html, "warning"))
+
+    def test_noindex_forms(self):
+        self.assertEqual(rules(self.check(page(ORIGIN + "/about", robots="none"))), ["page-indexable"])
+        bing = page(ORIGIN + "/about").replace("</head>", '<meta name="bingbot" content="NOINDEX, follow"></head>')
+        self.assertEqual(rules(self.check(bing)), ["page-indexable"])
+        other = page(ORIGIN + "/about").replace("</head>", '<meta name="gptbot" content="noindex"></head>')
+        self.assertEqual(self.check(other).findings, [])
+        repeated = d.Response(200, {"X-Robots-Tag": ["noindex", "all"]}, page(ORIGIN + "/about"))
+        self.assertEqual(rules(self.check(resp=repeated)), ["page-indexable"])
+        scoped = d.Response(200, {"X-Robots-Tag": ["GPTBot: noindex", "max-snippet: 20", "unavailable_after: 2030-01-01"]}, page(ORIGIN + "/about"))
+        self.assertEqual(self.check(resp=scoped).findings, [])
+        google = d.Response(200, {"X-Robots-Tag": "googlebot: none"}, page(ORIGIN + "/about"))
+        self.assertEqual(rules(self.check(resp=google)), ["page-indexable"])
+
+    def test_canonical_resolution(self):
+        self.assertEqual(self.check(page(ORIGIN + "/about", canonical="/about")).findings, [])
+        self.assertEqual(self.check(page(ORIGIN + "/about", canonical="https://EXAMPLE.com:443/about")).findings, [])
+        based = page(ORIGIN + "/about", canonical="about").replace("<head>", '<head><base href="/">')
+        self.assertEqual(self.check(based).findings, [])
+        self.assertEqual(rules(self.check(page(ORIGIN + "/about", canonical="/about?x=1"))), ["page-canonical"])
+        self.assertFalse(d.same_url("https://e.com:8443/a", "https://e.com/a"))
+        self.assertEqual(d.url_key("http://E.com:80/a#x"), "http://e.com/a")
+
+    def test_missing_head_end_tag_and_inert_templates(self):
+        no_head_end = (f'<html lang="en"><head><title>t</title><meta name="description" content="d">'
+                       f'<link rel="canonical" href="{ORIGIN}/about"><body><p>{WORDS}</p></body></html>')
+        self.assertEqual(rules(self.check(no_head_end)), [])
+        stray_text = f'<html lang="en"><head><title>t</title><meta name="description" content="d"><link rel="canonical" href="{ORIGIN}/about">{WORDS}'
+        self.assertEqual(rules(self.check(stray_text)), [])
+        hidden_h1 = page(ORIGIN + "/about", h1=0, body="Loading<template><h1>Hidden</h1></template>")
+        self.assertEqual(rules(self.check(hidden_h1)), ["page-served-content"])
+        template_noindex = page(ORIGIN + "/about").replace("</body>", '<template><meta name="robots" content="noindex"></template></body>')
+        self.assertEqual(self.check(template_noindex).findings, [])
+
+    def test_malformed_json_ld_shapes_do_not_crash(self):
+        for block in ('{"@type":"Organization","@graph":1}', '{"@type":"Organization","@graph":null}',
+                      '{"@type":["Organization",7,null]}', '{"@graph":{"@type":"WebSite"}}'):
+            self.assertEqual(self.check(page(ORIGIN + "/about", jsonld=(block,))).findings, [], block)
+        self.assertEqual(rules(self.check(page(ORIGIN + "/about", jsonld=('"text"',)))), ["structured-data"])
+
+    def test_w3c_lastmod_grammar(self):
+        for good in ("2026", "2026-11", "2026-11-19", "2026-11-19T12:00Z", "2026-11-19T12:00:00.5+01:00"):
+            self.assertIsNotNone(d._valid_lastmod(good), good)
+        for bad in ("20261119", "2026-W47-4", "2026-11-19T12:00:00", "2026-13-01", "2026-11-19T25:00Z"):
+            self.assertIsNone(d._valid_lastmod(bad), bad)
+        self.assertEqual(d._valid_lastmod("2026-11-19T12:00-02:00").utcoffset(), dt.timedelta(hours=-2))
+
+    def test_sitemap_size_gzip_and_doctype(self):
+        import gzip as gz
+        big = d.Response(200, {}, urlset(ORIGIN + "/"), truncated=True)
+        self.assertEqual(rules(self.live(**{ORIGIN + "/sitemap.xml": big})), ["sitemap-size"])
+        packed = d.Response(200, {}, gz.compress(urlset(ORIGIN + "/", ORIGIN + "/about").encode()))
+        self.assertEqual(self.live(**{ORIGIN + "/sitemap.xml": packed}).pages, 2)
+        broken = d.Response(200, {}, b"\x1f\x8b\x08\x00broken")
+        self.assertEqual(rules(self.live(**{ORIGIN + "/sitemap.xml": broken})), ["sitemap-xml"])
+        with mock.patch.object(d, "SITEMAP_LIMIT_BYTES", 10):
+            self.assertEqual(rules(self.live(**{ORIGIN + "/sitemap.xml": packed})), ["sitemap-size"])
+        doctype = '<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY a "aaaa">]>' + urlset(ORIGIN + "/")
+        self.assertEqual(rules(self.live(**{ORIGIN + "/sitemap.xml": doctype})), ["sitemap-xml"])
+
+    def test_large_page_is_flagged_not_mislabelled(self):
+        resp = d.Response(200, {}, page(ORIGIN + "/about"), truncated=True)
+        self.assertEqual(rules(self.check(resp=resp), "warning"), ["page-size"])
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "a.html").write_text("x" * 20)
+            got = d.StaticSource(Path(tmp), ORIGIN).get(ORIGIN + "/a", limit=10)
+            self.assertEqual((got.truncated, len(got.raw)), (True, 10))
+
+    def test_indexnow_batches_every_url(self):
+        key = "0123456789abcdef"
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        locs = [f"{ORIGIN}/p{i}" for i in range(d.INDEXNOW_BATCH + 1)]
+        site = healthy_site(**{ORIGIN + f"/{key}.txt": key, ORIGIN + "/sitemap.xml": urlset(*locs, lastmod=now)})
+        sent = []
+        args = argparse.Namespace(url=ORIGIN, key=key, since_hours=26.0, dry_run=False)
+        report = d.cmd_indexnow(args, site, post=lambda p: sent.append(len(p["urlList"])) or 200)
+        self.assertEqual((sent, report.pages, report.errors), ([d.INDEXNOW_BATCH, 1], d.INDEXNOW_BATCH + 1, 0))
+        failing = d.cmd_indexnow(args, site, post=lambda p: 500 if len(p["urlList"]) == 1 else 202)
+        self.assertEqual((failing.pages, rules(failing)), (d.INDEXNOW_BATCH, ["indexnow-submit"]))
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -443,9 +569,9 @@ class NetworkTests(unittest.TestCase):
     def test_live_source_does_not_follow_redirects(self):
         source = d.LiveSource(timeout=5)
         ok = source.get(self.base + "/page")
-        self.assertEqual((ok.status, ok.body, ok.headers["x-robots-tag"]), (200, "hello", "all"))
+        self.assertEqual((ok.status, ok.body, ok.headers["x-robots-tag"]), (200, "hello", ["all"]))
         moved = source.get(self.base + "/redirect")
-        self.assertEqual((moved.status, moved.headers["location"]), (301, "/elsewhere"))
+        self.assertEqual((moved.status, moved.header("location")), (301, "/elsewhere"))
         self.assertEqual(source.get(self.base + "/missing").status, 404)
         self.assertEqual(source.get("http://127.0.0.1:9/").status, 0)
 
