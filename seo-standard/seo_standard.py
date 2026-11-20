@@ -310,8 +310,11 @@ def robots_groups(text: str) -> list[tuple[set[str], list[tuple[bool, str]]]]:
 
 
 def _decode(target: str) -> str:
-    """A path for comparison: percent-escapes of unreserved characters decoded (RFC 9309 §2.2.2),
-    `%2F` and other reserved escapes kept, hex digits upper-cased."""
+    """A path or rule in one canonical form for comparison (RFC 9309 §2.2.2): non-ASCII characters
+    percent-encoded as UTF-8, escapes of unreserved characters decoded, every other escape (`%2F`
+    and the rest) kept with upper-case hex."""
+    target = "".join(c if ord(c) < 128 else urllib.parse.quote(c, safe="") for c in target)
+
     def one(m):
         ch = chr(int(m.group(1), 16))
         return ch if (ch.isalnum() and ch.isascii()) or ch in "-._~" else "%" + m.group(1).upper()
@@ -335,7 +338,7 @@ def allowed(text: str, agent: str, target: str = "/") -> bool:
     best: tuple[int, bool] | None = None
     for allow, pat in rules:
         if _pattern(pat).match(path):
-            key = (len(pat), allow)
+            key = (len(_decode(pat)), allow)  # precedence on the normalised rule
             if best is None or key > best:
                 best = key
     return best is None or best[1]
@@ -391,7 +394,8 @@ class Live:
         for _ in range(hops):
             if r.status not in REDIRECTS or not r.header("location"):
                 break
-            url = urllib.parse.urljoin(url, r.header("location"))
+            # every hop is mapped: a redirect naming the production host stays on the preview
+            url = self.url(urllib.parse.urljoin(url, r.header("location")))
             r = self.http.get(url, self.headers)
         return r
 

@@ -316,6 +316,13 @@ class Preview(unittest.TestCase):
         t[("GET", f"{self.BASE}/a")] = R(200, page("/a"))
         self.assertEqual(loud(run(t, "preview", base=self.BASE)), [])
 
+    def test_a_robots_redirect_to_the_production_host_stays_on_the_preview(self):
+        t = self.table()
+        t[("GET", f"{self.BASE}/robots.txt")] = R(301, location="https://example.com/real-robots.txt")
+        t[("GET", f"{self.BASE}/real-robots.txt")] = R(200, b"<!doctype html><html>", content_type="text/html")
+        t[("GET", "https://example.com/real-robots.txt")] = R(200, ROBOTS)
+        self.assertIn("robots-is-html", codes(run(t, "preview", base=self.BASE), "critical"))
+
     def test_preview_sitemap_urls_are_fetched_from_the_preview(self):
         t = self.table()
         t[("GET", f"{self.BASE}/a")] = R(404)
@@ -386,6 +393,12 @@ class Parsing(unittest.TestCase):
         self.assertFalse(seo.allowed("User-agent: *\nDisallow: /a\n", "googlebot", "/%61"), "%61 is a")
         self.assertFalse(seo.allowed("User-agent: *\nDisallow: /%7Ex\n", "googlebot", "/~x"))
         self.assertTrue(seo.allowed("User-agent: *\nDisallow: /a/b\n", "googlebot", "/a%2Fb"), "%2F stays reserved")
+        self.assertFalse(seo.allowed("User-agent: *\nAllow: /%61\nDisallow: /ab\n", "googlebot", "/ab"),
+                         "precedence is measured on the normalised rule: /a (2) loses to /ab (3)")
+        self.assertTrue(seo.allowed("User-agent: *\nDisallow: /%61\nAllow: /a\n", "googlebot", "/a"),
+                        "equal normalised rules: Allow wins")
+        self.assertFalse(seo.allowed("User-agent: *\nDisallow: /caf%C3%A9\n", "googlebot", "/café"))
+        self.assertFalse(seo.allowed("User-agent: *\nDisallow: /café\n", "googlebot", "/caf%c3%a9"))
         self.assertEqual(seo.robots_sitemaps("sitemap: https://x/a.xml\n"), ["https://x/a.xml"])
 
     def test_page_and_helpers(self):
