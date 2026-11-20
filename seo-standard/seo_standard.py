@@ -804,6 +804,7 @@ def indexnow(canonical: str, sitemaps: list[str], key: str, ledger, http: "Http"
         for u in pages:
             new["urls"][u]["accepted"] = new["urls"][u]["fingerprint"]
         new["initialized"] = True
+        record["baseline"] = True
         record["notes"].append(f"baseline: {len(pages)} eligible URLs recorded, nothing submitted")
         return done()
     changed = [u for u in pages if new["urls"][u]["accepted"] != new["urls"][u]["fingerprint"]
@@ -852,33 +853,42 @@ def ledger_name(canonical: str, workflow: str) -> str:
     return f"{LEDGER_ARTIFACT}-{host(canonical)}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"
 
 
-def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = LEDGER_ARTIFACT) -> dict | None:
-    """The newest unexpired ledger artifact with exactly this name that a run of this repository's
-    default branch made (never a fork's or another branch's), or None."""
+def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = LEDGER_ARTIFACT) -> tuple[object, str]:
+    """(ledger, state) for the newest artifact with exactly this name that a run of this repository's
+    default branch made (never a fork's or another branch's). state is:
+      "found"      the newest unexpired one, read (its content is still checked by indexnow)
+      "none"       there has never been one: the first baseline
+      "expired"    there were some, all expired: an unplanned baseline (ledger None)
+      "unreadable" the newest downloaded but is not a ledger archive: an unplanned baseline
+    Raises ConnectionError when GitHub cannot list or serve it: then the run must record nothing, or
+    it would replace a good ledger with a baseline and skip every change since."""
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={urllib.parse.quote(name)}&per_page=100", hdrs)
     if r.status != 200:
-        return None
+        raise ConnectionError(f"listing the ledger artifacts answered {r.status} (does the job have actions: read?)")
     try:
         listing = json.loads(r.body).get("artifacts", [])
     except (ValueError, AttributeError):
-        return None
-    own = [a for a in listing if isinstance(a, dict) and not a.get("expired") and a.get("name") == name
-           and (a.get("workflow_run") or {}).get("head_branch") == branch
-           and (a.get("workflow_run") or {}).get("head_repository_id") == (a.get("workflow_run") or {}).get("repository_id")]
+        raise ConnectionError("the ledger artifact listing is not JSON") from None
+    if not isinstance(listing, list):
+        raise ConnectionError("the ledger artifact listing has no artifact list")
+    ours = [a for a in listing if isinstance(a, dict) and a.get("name") == name
+            and (a.get("workflow_run") or {}).get("head_branch") == branch
+            and (a.get("workflow_run") or {}).get("head_repository_id") == (a.get("workflow_run") or {}).get("repository_id")]
+    own = [a for a in ours if not a.get("expired")]
     if not own:
-        return None
+        return None, "expired" if ours else "none"
     newest = max(own, key=lambda a: str(a.get("created_at", "")))
     z = http.get(newest.get("archive_download_url", ""), hdrs)
     while z.status in REDIRECTS and z.header("location"):
         z = http.get(z.header("location"))  # signed storage: the GitHub token is never sent there
     if z.status != 200:
-        return None
+        raise ConnectionError(f"downloading the newest ledger answered {z.status}")
     try:
         with zipfile.ZipFile(io.BytesIO(z.body)) as archive:
-            return json.loads(archive.read("ledger.json"))
+            return json.loads(archive.read("ledger.json")), "found"
     except (zipfile.BadZipFile, KeyError, ValueError):
-        return None
+        return "unreadable", "unreadable"
 
 
 def indexnow_markdown(record: dict) -> str:
@@ -1011,21 +1021,35 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
             print("indexnow: needs an https --canonical, a --sitemap, an 8-128 character [A-Za-z0-9-] --key, "
                   "and --branch with --repo", file=sys.stderr)
             return 2
-        ledger = None
+        ledger, state = None, "none"
         if args.ledger_in:
+            state = "found"
             try:
                 with open(args.ledger_in, encoding="utf-8") as f:
                     ledger = json.load(f)
             except (OSError, ValueError):
                 ledger = "unreadable"
         elif args.repo:
-            ledger = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", ""), args.branch,
-                                  ledger_name(args.canonical, args.workflow))
+            try:
+                ledger, state = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", ""), args.branch,
+                                             ledger_name(args.canonical, args.workflow))
+            except ConnectionError as e:
+                print(f"indexnow: the previous ledger could not be read, so nothing is submitted or recorded: {e}",
+                      file=sys.stderr)
+                return 2
         try:
             new, record = indexnow(args.canonical, args.sitemap, args.key, ledger, http, args.sha, dry_run=args.dry_run)
         except ConnectionError as e:
             print(f"indexnow: unreachable: {e}", file=sys.stderr)
             return 2
+        # The first baseline is planned. Any later one (an expired, corrupt or invalid ledger) means the
+        # URLs changed since IndexNow last accepted them were not submitted: say so on the run.
+        planned = state == "none" or (isinstance(ledger, dict) and ledger.get("initialized") is False)
+        if record.get("baseline") and not planned:
+            if state == "expired":
+                record["notes"].insert(0, "the previous ledger expired (no default-branch run within 90 days): starting a new baseline")
+            print(f"::warning title=IndexNow baseline::{record['host']}: {record['notes'][0]}. URLs changed since "
+                  "IndexNow last accepted them were not submitted; run the weekly schedule so the ledger never expires.")
         with open(args.ledger_out, "w", encoding="utf-8") as f:
             json.dump(new, f, indent=2, sort_keys=True)
         report = indexnow_markdown(record)

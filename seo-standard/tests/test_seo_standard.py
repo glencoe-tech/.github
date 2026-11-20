@@ -533,9 +533,12 @@ class IndexNow(unittest.TestCase):
         with open(os.path.join(os.path.dirname(seo.__file__), "action.yml"), encoding="utf-8") as f:
             action = f.read()
         gate = next(line for line in action.splitlines() if "inputs.indexnow-key != ''" in line)
-        self.assertIn("steps.seo.outputs.deployed == 'true'", gate)
-        self.assertIn("github.event_name == 'push'", gate)
+        self.assertIn("(github.event_name == 'push' && steps.seo.outputs.deployed == 'true')", gate)
+        self.assertIn("(github.event_name == 'schedule' && steps.seo.outputs.live == 'true')", gate)
+        self.assertNotIn("pull_request", gate)  # previews never submit
         self.assertIn("refs/heads/{0}', github.event.repository.default_branch", gate)
+        schedule, wait = action.index('if [ "$EVENT" = schedule ]'), action.index("--wait-only")
+        self.assertLess(schedule, wait)  # a scheduled run marks live, not deployed, and waits for nothing
         wait, mark = action.index("--wait-only"), action.index('echo "deployed=true" >> "$GITHUB_OUTPUT"')
         self.assertLess(wait, mark)  # written only after the wait returned successfully (set -e)
         self.assertNotIn("seo-standard-deployed", action)  # no shared marker another invocation could leave
@@ -758,15 +761,59 @@ class IndexNow(unittest.TestCase):
         t = {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(302, location="https://blob.example/z"),
              ("GET", "https://blob.example/z"): R(200, buf.getvalue())}
         h, fake = http(t)
-        self.assertEqual(seo.fetch_ledger(h, "o/r", "tok", "main", name), {"version": 1, "from": "main"})
+        self.assertEqual(seo.fetch_ledger(h, "o/r", "tok", "main", name), ({"version": 1, "from": "main"}, "found"))
         self.assertEqual(dict(fake.calls[0][1])["Authorization"], "Bearer tok")
         self.assertNotIn("Authorization", dict(fake.calls[-1][1]))  # never sent to signed storage
+        # GitHub could not list or serve it: the run must stop, never replace the ledger with a baseline.
         for table in ({("GET", api): R(403)}, {("GET", api): R(200, b"[1]")}, {("GET", api): R(200, b"not json")},
-                      {("GET", api): R(200, b'{"artifacts": []}')},
-                      {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(410)},
-                      {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(200, b"not a zip")}):
-            self.assertIsNone(seo.fetch_ledger(http(table)[0], "o/r", "tok", "main", name))
-        self.assertIsNone(seo.fetch_ledger(http({("GET", api): R(200, listing)})[0], "o/r", "tok", "release", name))
+                      {("GET", api): R(200, b'{"artifacts": 1}')},
+                      {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(410)}):
+            with self.assertRaises(ConnectionError):
+                seo.fetch_ledger(http(table)[0], "o/r", "tok", "main", name)
+        # Never one (another branch's do not count), only expired ones, or a corrupt archive.
+        self.assertEqual(seo.fetch_ledger(http({("GET", api): R(200, b'{"artifacts": []}')})[0], "o/r", "tok", "main", name), (None, "none"))
+        self.assertEqual(seo.fetch_ledger(http({("GET", api): R(200, listing)})[0], "o/r", "tok", "release", name), (None, "none"))
+        expired = json.dumps({"artifacts": [{"name": name, "expired": True, "created_at": "2026-08-01",
+                                             "workflow_run": run("main")}]}).encode()
+        self.assertEqual(seo.fetch_ledger(http({("GET", api): R(200, expired)})[0], "o/r", "tok", "main", name), (None, "expired"))
+        corrupt = {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(200, b"not a zip")}
+        self.assertEqual(seo.fetch_ledger(http(corrupt)[0], "o/r", "tok", "main", name), ("unreadable", "unreadable"))
+
+    def test_only_an_unplanned_baseline_warns_on_the_run(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        out, prev = os.path.join(d, "l.json"), os.path.join(d, "p.json")
+        wf = "o/r/.github/workflows/seo.yml@refs/heads/main"
+        name = seo.ledger_name(CANON, wf)
+        api = f"https://api.github.com/repos/o/r/actions/artifacts?name={name}&per_page=100"
+        base = ["indexnow", "--canonical", "https://example.com", "--sitemap", SITEMAP, "--key", self.KEY, "--ledger-out", out]
+        repo = base + ["--repo", "o/r", "--branch", "main", "--workflow", wf]
+        run = {"head_branch": "main", "repository_id": 1, "head_repository_id": 1}
+
+        def main(argv, table):
+            with redirect_stdout(io.StringIO()) as o:
+                self.assertEqual(seo.main(argv, http(table)[0], env={"GITHUB_TOKEN": "t"}), 0)
+            return o.getvalue()
+
+        t = self.site()
+        t[("GET", api)] = R(200, json.dumps({"artifacts": [{"name": name, "expired": True, "created_at": "2026-08-01",
+                                                            "workflow_run": run}]}).encode())
+        said = main(repo, t)
+        self.assertIn("::warning title=IndexNow baseline::example.com: the previous ledger expired", said)
+        self.assertIn("weekly schedule", said)
+        with open(out) as f:
+            self.assertIn("the previous ledger expired", json.load(f)["log"][-1]["notes"][0])
+        for bad in ("not json", json.dumps({"version": 1, "host": "other.example", "urls": {}, "log": [], "initialized": True})):
+            with open(prev, "w") as f:
+                f.write(bad)
+            self.assertIn("not a valid version-1 ledger", main(base + ["--ledger-in", prev], self.site()))
+        # A ledger whose first run never completed a baseline (the key was not served yet) is still planned.
+        with open(prev, "w") as f:
+            json.dump({"version": 1, "host": "example.com", "initialized": False, "retry_after": "", "urls": {}, "log": []}, f)
+        self.assertNotIn("::warning", main(base + ["--ledger-in", prev], self.site()))
+        # A good ledger is not a baseline at all.
+        shutil.copy(out, prev)
+        self.assertNotIn("::warning", main(base + ["--ledger-in", prev], self.site()))
 
     def test_cli(self):
         d = tempfile.mkdtemp()
@@ -782,7 +829,8 @@ class IndexNow(unittest.TestCase):
         self.assertIn("not proof of crawling or indexing", o.getvalue())
         with open(prev, "w") as f:
             f.write("not json")
-        self.assertEqual(seo.main(base + ["--ledger-in", prev, "--md", md], http(self.site())[0]), 0)
+        with redirect_stdout(io.StringIO()):  # an unreadable ledger warns (see the test above)
+            self.assertEqual(seo.main(base + ["--ledger-in", prev, "--md", md], http(self.site())[0]), 0)
         shutil.copy(out, prev)
         t = self.site()
         self.change(t, word=b"new")
@@ -795,11 +843,19 @@ class IndexNow(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as named:
             self.assertEqual(seo.main(base + ["--workflow", wf, "--print-ledger-name"]), 0)
         self.assertEqual(named.getvalue().strip(), seo.ledger_name(CANON, wf))
+        repo = base + ["--repo", "o/r", "--branch", "main", "--workflow", wf]
         t2 = self.site()
         t2[("GET", api)] = R(404)
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(seo.main(base + ["--repo", "o/r", "--branch", "main", "--workflow", wf], http(t2)[0],
-                                      env={"GITHUB_TOKEN": "t"}), 0)
+        os.remove(out)
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(seo.main(repo, http(t2)[0], env={"GITHUB_TOKEN": "t"}), 2)
+        self.assertIn("nothing is submitted or recorded", err.getvalue())
+        self.assertFalse(os.path.exists(out))  # no ledger written, so the good one stays the newest
+        t2[("GET", api)] = R(200, b'{"artifacts": []}')
+        with redirect_stdout(io.StringIO()) as first:
+            self.assertEqual(seo.main(repo, http(t2)[0], env={"GITHUB_TOKEN": "t"}), 0)
+        self.assertIn("baseline", first.getvalue())
+        self.assertNotIn("::warning", first.getvalue())  # the first baseline is planned
         t3 = self.site()
         del t3[("GET", f"https://example.com/{self.KEY}.txt")]
         with redirect_stderr(io.StringIO()):
