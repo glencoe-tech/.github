@@ -36,6 +36,7 @@ import time
 import urllib.error
 import urllib.parse
 import zipfile
+import zlib
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -69,6 +70,7 @@ INDEXNOW_ACCEPTED = (200, 202)
 INDEXNOW_FORGET_DAYS = 365   # a URL not seen for this long leaves the ledger
 LEDGER_LOG = 200             # submission records kept in the ledger
 LEDGER_ARTIFACT = "seo-standard-indexnow-ledger"
+LEDGER_PAGES = 50             # artifact listing pages read (100 each) before giving up
 CHILD_SITEMAPS = 10
 # Crawlers that put a site in search results, classic or AI. Blocking one hides the site from it.
 SEARCH_CRAWLERS = ("googlebot", "bingbot")
@@ -747,6 +749,7 @@ def _valid_ledger(ledger, h: str) -> tuple[dict | None, str]:
     if not (isinstance(ledger, dict) and ledger.get("version") == 1 and ledger.get("host") == h
             and isinstance(ledger.get("urls"), dict) and isinstance(ledger.get("log"), list)
             and isinstance(ledger.get("initialized"), bool)
+            and isinstance(ledger.get("reset", ""), str)
             and (ledger.get("retry_after", "") == "" or _is_time(ledger.get("retry_after")))
             and all(isinstance(u, str) and entry_ok(e) for u, e in ledger["urls"].items())):
         return None, "the previous ledger is not a valid version-1 ledger for this host: starting a new baseline"
@@ -762,22 +765,30 @@ def _utcnow() -> datetime.datetime:
 
 
 def indexnow(canonical: str, sitemaps: list[str], key: str, ledger, http: "Http",
-             sha: str = "", now: str | None = None, dry_run: bool = False, clock=_utcnow) -> tuple[dict, dict]:
+             sha: str = "", now: str | None = None, dry_run: bool = False, clock=_utcnow,
+             lost: str = "") -> tuple[dict, dict]:
     """(new ledger, this run's record). Submits only eligible URLs whose fingerprint differs from
     the one IndexNow last accepted. Until a run has recorded a baseline, nothing is submitted, so a
     first run never re-announces a whole site. A URL missing for a while keeps its accepted
     fingerprint, so its return unchanged is not a change. 'accepted' means IndexNow took the URLs;
-    it is never proof that anything was crawled or indexed."""
+    it is never proof that anything was crawled or indexed.
+
+    `lost` is why an earlier ledger could not be used (it expired); an invalid one is a reason too.
+    That reason is kept in the new ledger ("reset") until a baseline completes, even across runs
+    that end early, and the completing baseline reports it as record["unplanned"]."""
     now = now or clock().strftime("%Y-%m-%dT%H:%M:%SZ")
     h = host(canonical)
     record: dict = {"time": now, "sha": sha, "host": h, "submitted": 0, "accepted": 0, "failed": 0,
                     "status": [], "notes": [], "dry_run": dry_run}
     valid, why = _valid_ledger(ledger, h)
+    why = lost or why
     if why:
         record["notes"].append(why)
     new = copy.deepcopy(valid) if valid else {"version": 1, "host": h, "initialized": False, "retry_after": "",
                                               "urls": {}, "log": []}
     new.setdefault("retry_after", "")
+    if why:
+        new["reset"] = why
 
     def done() -> tuple[dict, dict]:
         new["log"] = (new["log"] + [record])[-LEDGER_LOG:]
@@ -804,6 +815,11 @@ def indexnow(canonical: str, sitemaps: list[str], key: str, ledger, http: "Http"
         for u in pages:
             new["urls"][u]["accepted"] = new["urls"][u]["fingerprint"]
         new["initialized"] = True
+        record["baseline"] = True
+        # Every completed baseline is reported once: with the reason it started, or, for a ledger that
+        # never recorded one (an earlier version's pending first run), with the generic one.
+        record["unplanned"] = new.pop("reset", "") or ("no earlier baseline was recorded: starting a new one. That is "
+                                                       "expected on the first run after adoption")
         record["notes"].append(f"baseline: {len(pages)} eligible URLs recorded, nothing submitted")
         return done()
     changed = [u for u in pages if new["urls"][u]["accepted"] != new["urls"][u]["fingerprint"]
@@ -852,33 +868,63 @@ def ledger_name(canonical: str, workflow: str) -> str:
     return f"{LEDGER_ARTIFACT}-{host(canonical)}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"
 
 
-def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = LEDGER_ARTIFACT) -> dict | None:
-    """The newest unexpired ledger artifact with exactly this name that a run of this repository's
-    default branch made (never a fork's or another branch's), or None."""
+def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = LEDGER_ARTIFACT) -> tuple[object, str]:
+    """(ledger, state) for the newest artifact with exactly this name that a run of this repository's
+    default branch made (never a fork's or another branch's). Every listing page is read first, so a
+    ledger behind newer artifacts from other branches is still found. state is:
+      "found"      the newest unexpired one, read (its content is still checked by indexnow)
+      "none"       none is listed. GitHub stopped listing expired artifacts (2026-09-24), so this is
+                   either the first run after adoption or a ledger that expired: it cannot tell
+      "expired"    only expired ones are listed (older listing behaviour): an unplanned baseline
+      "unreadable" the newest downloaded but is not a ledger (bad archive, or JSON null)
+    Raises ConnectionError when GitHub cannot list or serve it, or answers with something that is not
+    a listing: then the run must record nothing, or it would replace a good ledger with a baseline
+    and skip every change since."""
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={urllib.parse.quote(name)}&per_page=100", hdrs)
-    if r.status != 200:
-        return None
-    try:
-        listing = json.loads(r.body).get("artifacts", [])
-    except (ValueError, AttributeError):
-        return None
-    own = [a for a in listing if isinstance(a, dict) and not a.get("expired") and a.get("name") == name
-           and (a.get("workflow_run") or {}).get("head_branch") == branch
-           and (a.get("workflow_run") or {}).get("head_repository_id") == (a.get("workflow_run") or {}).get("repository_id")]
+    listing: list = []
+    n = 0
+    while True:  # every page, up to one past the cap, so exactly the cap still ends
+        n += 1
+        r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={urllib.parse.quote(name)}"
+                     f"&per_page=100&page={n}", hdrs)
+        if r.status != 200:
+            raise ConnectionError(f"listing the ledger artifacts answered {r.status} (does the job have actions: read?)")
+        try:
+            page = json.loads(r.body).get("artifacts")
+        except (ValueError, AttributeError):
+            raise ConnectionError("the ledger artifact listing is not JSON") from None
+        if not isinstance(page, list):
+            raise ConnectionError("the ledger artifact listing has no artifact list")
+        listing += page
+        if len(listing) > LEDGER_PAGES * 100:
+            break  # over the cap: raise below rather than guess
+        if len(page) < 100:
+            break
+    if len(listing) > LEDGER_PAGES * 100:
+        raise ConnectionError(f"more than {LEDGER_PAGES * 100} ledger artifacts: the listing was not read to the end "
+                              "(delete old ledger artifacts to recover)")
+    ours = [a for a in listing if isinstance(a, dict) and a.get("name") == name
+            and (a.get("workflow_run") or {}).get("head_branch") == branch
+            and (a.get("workflow_run") or {}).get("head_repository_id") == (a.get("workflow_run") or {}).get("repository_id")]
+    own = [a for a in ours if not a.get("expired")]
     if not own:
-        return None
+        return None, "expired" if ours else "none"
     newest = max(own, key=lambda a: str(a.get("created_at", "")))
     z = http.get(newest.get("archive_download_url", ""), hdrs)
     while z.status in REDIRECTS and z.header("location"):
         z = http.get(z.header("location"))  # signed storage: the GitHub token is never sent there
     if z.status != 200:
-        return None
+        raise ConnectionError(f"downloading the newest ledger answered {z.status}")
     try:
         with zipfile.ZipFile(io.BytesIO(z.body)) as archive:
-            return json.loads(archive.read("ledger.json"))
-    except (zipfile.BadZipFile, KeyError, ValueError):
-        return None
+            ledger = json.loads(archive.read("ledger.json"))
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, KeyError, ValueError, zlib.error, EOFError, OSError,
+            NotImplementedError, RuntimeError):
+        # Downloaded but not readable as a ledger: a new baseline replaces it, so it cannot stall runs.
+        return "unreadable", "unreadable"
+    if ledger is None:
+        return "unreadable", "unreadable"  # a null document is not "no ledger"
+    return ledger, "found"
 
 
 def indexnow_markdown(record: dict) -> str:
@@ -1011,21 +1057,40 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
             print("indexnow: needs an https --canonical, a --sitemap, an 8-128 character [A-Za-z0-9-] --key, "
                   "and --branch with --repo", file=sys.stderr)
             return 2
-        ledger = None
+        ledger, state = None, "none"
         if args.ledger_in:
+            state = "found"
             try:
                 with open(args.ledger_in, encoding="utf-8") as f:
                     ledger = json.load(f)
             except (OSError, ValueError):
                 ledger = "unreadable"
+            if ledger is None:
+                ledger = "unreadable"  # a null document is not "no ledger"
         elif args.repo:
-            ledger = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", ""), args.branch,
-                                  ledger_name(args.canonical, args.workflow))
+            try:
+                ledger, state = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", ""), args.branch,
+                                             ledger_name(args.canonical, args.workflow))
+            except ConnectionError as e:
+                print(f"indexnow: the previous ledger could not be read, so nothing is submitted or recorded: {e}",
+                      file=sys.stderr)
+                return 2
+        lost = {"expired": "the previous ledger has expired: starting a new baseline",
+                "none": "no previous ledger was found: starting a new baseline. That is expected on the first "
+                        "run after adoption; otherwise the ledger was lost (it expired)"}.get(state, "")
         try:
-            new, record = indexnow(args.canonical, args.sitemap, args.key, ledger, http, args.sha, dry_run=args.dry_run)
+            new, record = indexnow(args.canonical, args.sitemap, args.key, ledger, http, args.sha,
+                                   dry_run=args.dry_run, lost=lost)
         except ConnectionError as e:
             print(f"indexnow: unreachable: {e}", file=sys.stderr)
             return 2
+        # Every baseline that starts from nothing warns, once: no listed ledger (GitHub no longer lists
+        # expired ones, so a first run and an expired ledger look alike), or an expired, corrupt or
+        # invalid one, even several runs earlier. On the first run after adoption that is expected.
+        if record.get("unplanned"):
+            print(f"::warning title=IndexNow baseline::{record['host']}: {record['unplanned']}. Nothing was submitted: "
+                  "after a lost ledger, URLs changed since IndexNow last accepted them were skipped. Check that the "
+                  "weekly schedule is enabled and running.")
         with open(args.ledger_out, "w", encoding="utf-8") as f:
             json.dump(new, f, indent=2, sort_keys=True)
         report = indexnow_markdown(record)

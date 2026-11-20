@@ -100,11 +100,28 @@ are blocked. Blocking those is a legitimate choice for each client.
 
 Set `indexnow-key` to tell IndexNow (Bing, Yandex, Seznam, Naver and others) which pages changed.
 The site must serve the key at `https://<host>/<key>.txt`. The key is public by design and is not
-a credential. Give the job `actions: read` as well as `checks: read`.
+a credential. In `seo.yml`, add to the snippet above:
 
-- **When:** only on a push to the default branch, and only after this invocation's deploy check
-  succeeded for that commit (a step output, never a shared file). A failed or skipped deploy
-  submits nothing. Pull requests and previews never submit.
+```yaml
+on:
+  # ...pull_request and push as above, plus:
+  schedule:
+    - cron: "41 5 * * 1"   # weekly: refreshes the ledger between deploys, catches changes made outside a deploy
+permissions:
+  contents: read
+  checks: read
+  actions: read          # to read the previous IndexNow ledger
+concurrency:             # one ledger writer at a time; pull requests are never queued behind it
+  group: seo-${{ github.event_name == 'pull_request' && github.ref || 'production' }}
+  cancel-in-progress: false
+```
+
+and `indexnow-key: <key>` under `with:`.
+
+- **When:** on the default branch only. On a push, only after this invocation's deploy check
+  succeeded for that commit (a step output, never a shared file); a failed or skipped deploy
+  submits nothing. On a scheduled run, against what is live, with no deploy to wait for. Pull
+  requests and previews never submit.
 - **What:** only eligible sitemap URLs. An eligible URL is on the production origin (scheme, host
   and port), has no `#fragment`, is allowed for Bingbot, answers 200, is not `noindex`, and names
   exactly itself as canonical. The canonical is required, and is resolved against `<base href>`.
@@ -126,8 +143,25 @@ a credential. Give the job `actions: read` as well as `checks: read`.
   is kept as an artifact for 90 days. It is named `seo-standard-indexnow-ledger-<host>-<hash of the
   calling workflow file>`, so each site and workflow keeps its own. Only artifacts with exactly that
   name from this repository's default-branch runs are read; never a fork's, another branch's or
-  another workflow's. An invalid ledger, including a bad timestamp, starts a new baseline, and the
-  reason is recorded. The job summary shows each run.
+  another workflow's. The job summary shows each run.
+- **When the ledger cannot be used:**
+  - GitHub cannot list or serve it (an API error, or a job without `actions: read`): the run
+    submits and records nothing and warns, so the last good ledger stays the newest.
+  - It expired, or it is corrupt or invalid (including a bad timestamp): the run starts a new
+    baseline, records why, and puts a `::warning::` on the run. URLs that changed since IndexNow
+    last accepted them are not submitted. The reason stays in the ledger until a baseline
+    completes, so a run that ends early (the key not served, say) does not lose the warning.
+  - None is listed: also a new baseline with a warning. GitHub no longer lists expired artifacts, so
+    a first run after adoption and an expired ledger look the same. Every completed baseline warns
+    exactly once, with the reason it started; on the first run after adoption the warning is
+    expected.
+  - Over 5,000 ledger artifacts within retention: the run stops and warns rather than guess.
+    Delete old ledger artifacts to recover.
+  - The weekly schedule makes expiry unlikely, not impossible. GitHub can drop a scheduled run, and
+    it disables schedules in a public repository after 60 days without activity. The warning is
+    the backstop.
+  - Every page of the artifact listing is read, so a ledger behind newer artifacts from other
+    branches is still found.
 - **Not proof of indexing:** "accepted" means IndexNow received the URLs, nothing more. Coverage
   comes from Search Console and Bing Webmaster Tools.
 
