@@ -527,6 +527,66 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual((failing.pages, rules(failing)), (d.INDEXNOW_BATCH, ["indexnow-submit"]))
 
 
+class DeltaReviewRegressionTests(unittest.TestCase):
+    """One test per defect found in the delta review of glencoe-tech/.github#28 (c484f7e)."""
+
+    def live(self, **pages):
+        return d.cmd_live(argparse.Namespace(url=ORIGIN), healthy_site(**pages))
+
+    def check(self, html=None, resp=None, url=ORIGIN + "/about"):
+        report = d.Report(mode="live", target=ORIGIN)
+        d.check_page(report, url, resp or d.Response(200, {}, html), ORIGIN, False)
+        return report
+
+    def test_out_of_range_zone_is_invalid_not_a_crash(self):
+        self.assertIsNone(d._valid_lastmod("2026-11-19T12:00+99:00"))
+        report = self.live(**{ORIGIN + "/sitemap.xml": urlset(ORIGIN + "/", lastmod="2026-11-19T12:00+99:00")})
+        self.assertEqual(rules(report, "warning"), ["sitemap-lastmod"])
+
+    def test_robots_redirects_are_followed_and_429_is_unavailable(self):
+        moved = self.live(**{
+            ORIGIN + "/robots.txt": d.Response(301, {"location": "/real-robots.txt"}),
+            ORIGIN + "/real-robots.txt": "User-agent: *\nDisallow: /\n",
+        })
+        self.assertIn("search-crawler-allowed", rules(moved))
+        loop = self.live(**{ORIGIN + "/robots.txt": d.Response(302, {"location": "/robots.txt"})})
+        self.assertEqual((rules(loop), rules(loop, "warning")), ([], ["robots-present"]))
+        busy = self.live(**{ORIGIN + "/robots.txt": d.Response(429)})
+        self.assertIn("robots-present", rules(busy))
+        self.assertIn("search-crawler-allowed", rules(busy))
+
+    def test_percent_encoding_is_normalised(self):
+        groups, _ = d.parse_robots("User-agent: *\nDisallow: /private\nDisallow: /café\nDisallow: /a%2fb\n")
+        self.assertFalse(d.path_allowed(groups, "Bingbot", "/%70rivate"))
+        self.assertFalse(d.path_allowed(groups, "Bingbot", "/caf%C3%A9"))
+        self.assertFalse(d.path_allowed(groups, "Bingbot", "/caf%c3%a9/menu"))
+        self.assertFalse(d.path_allowed(groups, "Bingbot", "/a%2Fb"))  # reserved escapes keep their meaning
+        self.assertTrue(d.path_allowed(groups, "Bingbot", "/a/b"))
+        self.assertEqual(d.normalise_path("/%7euser/%zz"), "/~user/%zz")
+
+    def test_combined_scopes_in_one_header(self):
+        self.assertTrue(d.header_noindex(["bingbot: nofollow, googlebot: noindex"]))
+        self.assertTrue(d.header_noindex(["googlebot: nofollow, noindex"]))
+        self.assertFalse(d.header_noindex(["googlebot: nofollow, gptbot: noindex"]))
+        self.assertFalse(d.header_noindex(["max-snippet: 20, nofollow"]))
+
+    def test_every_title_is_head_content(self):
+        second = page(ORIGIN + "/about", h1=0, body="Loading").replace("</title>", "</title><title>" + WORDS + "</title>")
+        report = self.check(second)
+        self.assertEqual(rules(report), ["page-served-content"])
+        svg_only = page(ORIGIN + "/about", title=None, body=WORDS + "<svg><title>Chart</title></svg>")
+        self.assertEqual(rules(self.check(svg_only)), ["page-title"])
+
+    def test_malformed_canonical_is_a_finding(self):
+        report = self.check(page(ORIGIN + "/about", canonical="https://example.com:bad/about"))
+        self.assertEqual(rules(report), ["page-canonical"])
+        self.assertIn("not a valid URL", report.findings[0].message)
+
+    def test_corrupt_gzip_is_a_finding(self):
+        corrupt = d.Response(200, {}, bytes.fromhex("1f8b080000000000000007"))
+        self.assertEqual(rules(self.live(**{ORIGIN + "/sitemap.xml": corrupt})), ["sitemap-xml"])
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass

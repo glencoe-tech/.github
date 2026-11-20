@@ -22,6 +22,7 @@ import io
 import json
 import re
 import sys
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -231,6 +232,27 @@ def _agent_rules(groups: dict[str, list[tuple[str, str]]], agent: str) -> list[t
     return groups[max(matches, key=len)] if matches else groups.get("*", [])
 
 
+_UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+
+def normalise_path(path: str) -> str:
+    """RFC 9309 2.2.2: compare paths as octets. Non-ASCII is percent-encoded as UTF-8; an encoded
+    unreserved character is decoded; every other escape keeps its meaning, in upper-case hex."""
+    out: list[str] = []
+    i = 0
+    while i < len(path):
+        c = path[i]
+        hexpair = path[i + 1 : i + 3]
+        if c == "%" and len(hexpair) == 2 and all(h in "0123456789abcdefABCDEF" for h in hexpair):
+            char = chr(int(hexpair, 16))
+            out.append(char if char in _UNRESERVED else "%" + hexpair.upper())
+            i += 3
+            continue
+        out.append(c if ord(c) < 128 else "".join(f"%{b:02X}" for b in c.encode("utf-8")))
+        i += 1
+    return "".join(out)
+
+
 def _pattern_matches(pattern: str, path: str) -> bool:
     anchored = pattern.endswith("$")
     body = pattern[:-1] if anchored else pattern
@@ -243,8 +265,10 @@ def path_allowed(groups: dict[str, list[tuple[str, str]]], agent: str, path: str
     pattern wins (a trailing * adds nothing: /fish* equals /fish); Allow wins a tie."""
     if path == "/robots.txt":
         return True
+    path = normalise_path(path)
     best = (-1, True)
-    for directive, pattern in _agent_rules(groups, agent):
+    for directive, raw_pattern in _agent_rules(groups, agent):
+        pattern = normalise_path(raw_pattern)
         if not pattern or not _pattern_matches(pattern, path):
             continue
         effective = len(pattern.rstrip("$").rstrip("*"))
@@ -263,11 +287,18 @@ def check_robots(report: Report, source, origin: str) -> tuple[list[str], dict[s
     everything; a 5xx or unreachable one means the whole site is disallowed."""
     url = origin + "/robots.txt"
     resp = source.get(url)
+    hops = 0
+    while 300 <= resp.status < 400 and resp.header("location") and hops < 5:
+        hops += 1
+        resp = source.get(urllib.parse.urljoin(url, resp.header("location").split(",")[0].strip()))
     fallback = [origin + "/sitemap.xml"]
-    if resp.status == 0 or resp.status >= 500:
+    if 300 <= resp.status < 400:
+        report.warn("robots-present", url, "robots.txt redirects more than five times or nowhere; crawlers treat it as missing")
+        groups, sitemaps = {}, []
+    elif resp.status in (0, 429) or resp.status >= 500:
         report.error("robots-present", url, f"robots.txt answered {resp.status or 'nothing'}: crawlers treat the whole site as disallowed")
         return fallback, {"*": [("disallow", "/")]}
-    if resp.status != 200:
+    elif resp.status != 200:
         report.warn("robots-present", url, f"robots.txt answered {resp.status}: crawlers may fetch everything, and no Sitemap: line points them anywhere")
         groups, sitemaps = {}, []
     else:
@@ -308,11 +339,11 @@ def _valid_lastmod(value: str) -> dt.datetime | None:
     if not match:
         return None
     year, month, day, hour, minute, second, zone = match.groups()
-    tz = dt.timezone.utc
-    if zone and zone != "Z":
-        sign = 1 if zone[0] == "+" else -1
-        tz = dt.timezone(sign * dt.timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6])))
     try:
+        tz = dt.timezone.utc
+        if zone and zone != "Z":
+            sign = 1 if zone[0] == "+" else -1
+            tz = dt.timezone(sign * dt.timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6])))
         return dt.datetime(int(year), int(month or 1), int(day or 1), int(hour or 0), int(minute or 0), int(second or 0), tzinfo=tz)
     except ValueError:
         return None
@@ -327,7 +358,7 @@ def _sitemap_text(report: Report, sitemap: str, resp: Response) -> str | None:
         try:
             with gzip.GzipFile(fileobj=io.BytesIO(raw)) as handle:
                 raw = handle.read(SITEMAP_LIMIT_BYTES + 1)
-        except (OSError, EOFError) as exc:
+        except (OSError, EOFError, zlib.error) as exc:
             report.error("sitemap-xml", sitemap, f"gzip sitemap does not decompress: {exc}")
             return None
         truncated = len(raw) > SITEMAP_LIMIT_BYTES
@@ -418,6 +449,7 @@ class PageParser(HTMLParser):
         self.words = 0
         self._in_head = False
         self._in_title = False
+        self._page_title = False
         self._in_jsonld = False
         self._hidden = 0
         self._template = 0
@@ -437,8 +469,9 @@ class PageParser(HTMLParser):
             return
         if tag == "html":
             self.lang = a.get("lang", "").strip()
-        elif tag == "title" and not self.title:
+        elif tag == "title":
             self._in_title, self._buffer = True, []
+            self._page_title = not self._hidden and not self.title
         elif tag == "base" and not self.base:
             self.base = a.get("href", "").strip()
         elif tag == "meta":
@@ -460,7 +493,9 @@ class PageParser(HTMLParser):
         if tag == "template" and self._template:
             self._template -= 1
         if tag == "title" and self._in_title:
-            self.title, self._in_title = "".join(self._buffer).strip(), False
+            if self._page_title:
+                self.title = "".join(self._buffer).strip()
+            self._in_title = False
         elif tag == "script" and self._in_jsonld:
             self.jsonld.append("".join(self._buffer))
             self._in_jsonld = False
@@ -503,12 +538,13 @@ def meta_noindex(page: PageParser) -> list[str]:
 def header_noindex(values: list[str]) -> bool:
     """Does any X-Robots-Tag value tell a search crawler noindex? `GPTBot: noindex` does not."""
     for value in values:
-        match = re.match(r"\s*([A-Za-z][A-Za-z0-9_.-]*)\s*:\s*(.*)$", value)
-        if match and match.group(1).lower() not in VALUED_DIRECTIVES:
-            if match.group(1).lower() in SEARCH_SCOPES and _directive_noindex(match.group(2)):
+        scope = "robots"  # a value without a crawler prefix addresses every crawler
+        for token in value.split(","):
+            match = re.match(r"\s*([A-Za-z][A-Za-z0-9_.-]*)\s*:\s*(.*)$", token)
+            if match and match.group(1).lower() not in VALUED_DIRECTIVES:
+                scope, token = match.group(1).lower(), match.group(2)
+            if scope in SEARCH_SCOPES and _directive_noindex(token):
                 return True
-        elif _directive_noindex(value):
-            return True
     return False
 
 
@@ -552,8 +588,13 @@ def check_page(report: Report, url: str, resp: Response, origin: str, home: bool
         report.error("page-canonical", url, f"{len(page.canonicals)} canonical links, expected exactly 1")
     else:
         resolved = urllib.parse.urljoin(urllib.parse.urljoin(url, page.base), page.canonicals[0])
-        if not same_url(resolved, url):
-            report.error("page-canonical", url, f"canonical {resolved} is not the sitemap URL")
+        try:
+            matches = same_url(resolved, url)
+        except ValueError:
+            report.error("page-canonical", url, f"canonical {page.canonicals[0]} is not a valid URL")
+        else:
+            if not matches:
+                report.error("page-canonical", url, f"canonical {resolved} is not the sitemap URL")
     if page.words < MIN_WORDS and page.h1 == 0:
         report.error(
             "page-served-content",
