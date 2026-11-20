@@ -799,11 +799,20 @@ class IndexNow(unittest.TestCase):
                  ("GET", "https://api.github.com/zip/new"): R(302, location="https://blob.example/z"),
                  ("GET", "https://blob.example/z"): R(200, buf.getvalue())}
         self.assertEqual(seo.fetch_ledger(http(paged)[0], "o/r", "tok", "main", name), ({"version": 1, "from": "main"}, "found"))
-        # A listing that never ends is not read as "none".
-        endless = {("GET", api.replace("&page=1", f"&page={i}")): R(200, json.dumps({"artifacts": other}).encode())
-                   for i in range(1, seo.LEDGER_PAGES + 1)}
-        with self.assertRaises(ConnectionError):
+        # Exactly the cap still ends (the page after it is empty); one page more is not read as "none".
+        full = lambda i: ("GET", api.replace("&page=1", f"&page={i}"))  # noqa: E731
+        at_cap = {full(i): R(200, json.dumps({"artifacts": other}).encode()) for i in range(1, seo.LEDGER_PAGES + 1)}
+        at_cap[full(seo.LEDGER_PAGES + 1)] = R(200, b'{"artifacts": []}')
+        self.assertEqual(seo.fetch_ledger(http(at_cap)[0], "o/r", "tok", "main", name), (None, "none"))
+        endless = {**at_cap, full(seo.LEDGER_PAGES + 1): R(200, json.dumps({"artifacts": other}).encode())}
+        with self.assertRaisesRegex(ConnectionError, "delete old ledger artifacts"):
             seo.fetch_ledger(http(endless)[0], "o/r", "tok", "main", name)
+        # A ledger.json holding JSON null is unreadable, not "no ledger".
+        null = io.BytesIO()
+        with zipfile.ZipFile(null, "w") as z:
+            z.writestr("ledger.json", "null")
+        nulled = {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(200, null.getvalue())}
+        self.assertEqual(seo.fetch_ledger(http(nulled)[0], "o/r", "tok", "main", name), ("unreadable", "unreadable"))
 
     def test_only_an_unplanned_baseline_warns_on_the_run(self):
         d = tempfile.mkdtemp()
@@ -830,7 +839,7 @@ class IndexNow(unittest.TestCase):
         with open(out) as f:
             self.assertIn("the previous ledger has expired", json.load(f)["log"][-1]["notes"][0])
         self.assertNotIn("reset", json.load(open(out)))  # the reason is reported once, then cleared
-        for bad in ("not json", json.dumps({"version": 1, "host": "other.example", "urls": {}, "log": [], "initialized": True}),
+        for bad in ("not json", "null", json.dumps({"version": 1, "host": "other.example", "urls": {}, "log": [], "initialized": True}),
                     # rejected even though it says it never finished a baseline
                     json.dumps({"version": 1, "host": "other.example", "urls": {}, "log": [], "initialized": False})):
             with open(prev, "w") as f:
@@ -899,7 +908,10 @@ class IndexNow(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as first:
             self.assertEqual(seo.main(repo, http(t2)[0], env={"GITHUB_TOKEN": "t"}), 0)
         self.assertIn("baseline", first.getvalue())
-        self.assertNotIn("::warning", first.getvalue())  # the first baseline is planned
+        # GitHub no longer lists expired artifacts, so "none listed" may be a lost ledger: it warns, saying a
+        # first run after adoption is the expected case.
+        self.assertIn("::warning title=IndexNow baseline::example.com: no previous ledger was found", first.getvalue())
+        self.assertIn("expected on the first run after adoption", first.getvalue())
         t3 = self.site()
         del t3[("GET", f"https://example.com/{self.KEY}.txt")]
         with redirect_stderr(io.StringIO()):

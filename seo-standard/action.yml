@@ -54,7 +54,7 @@ inputs:
       IndexNow. Submits on the default branch only: on a push after this invocation's deploy check
       succeeded, or on a scheduled run against the live site. Only canonical, indexable URLs whose
       content changed since IndexNow last accepted them. The first run records a baseline and
-      submits nothing. The ledger is a 90-day artifact: a weekly schedule keeps it from expiring.
+      submits nothing. The ledger is a 90-day artifact: a weekly schedule refreshes it between deploys.
     required: false
     default: ""
 
@@ -108,7 +108,7 @@ runs:
 
     # IndexNow runs even when the audit found problems: it submits only URLs that are eligible on
     # their own. It runs on the default branch only: on a push after this invocation's deploy check
-    # succeeded, or on a scheduled run against the live site (which keeps the ledger from expiring
+    # succeeded, or on a scheduled run against the live site (which refreshes the ledger between deploys
     # and catches changes made outside a deploy). A refusal never fails the job.
     - name: IndexNow (changed canonical URLs, after the deploy)
       id: indexnow

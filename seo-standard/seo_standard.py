@@ -871,15 +871,16 @@ def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = L
     default branch made (never a fork's or another branch's). Every listing page is read first, so a
     ledger behind newer artifacts from other branches is still found. state is:
       "found"      the newest unexpired one, read (its content is still checked by indexnow)
-      "none"       there has never been one: the first baseline
-      "expired"    there were some, all expired: an unplanned baseline (ledger None)
-      "unreadable" the newest downloaded but is not a ledger archive: an unplanned baseline
+      "none"       none is listed. GitHub stopped listing expired artifacts (2026-09-24), so this is
+                   either the first run after adoption or a ledger that expired: it cannot tell
+      "expired"    only expired ones are listed (older listing behaviour): an unplanned baseline
+      "unreadable" the newest downloaded but is not a ledger (bad archive, or JSON null)
     Raises ConnectionError when GitHub cannot list or serve it, or answers with something that is not
     a listing: then the run must record nothing, or it would replace a good ledger with a baseline
     and skip every change since."""
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     listing: list = []
-    for n in range(1, LEDGER_PAGES + 1):
+    for n in range(1, LEDGER_PAGES + 2):  # one page past the cap, so exactly the cap still ends
         r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={urllib.parse.quote(name)}"
                      f"&per_page=100&page={n}", hdrs)
         if r.status != 200:
@@ -894,7 +895,8 @@ def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = L
         if len(page) < 100:
             break
     else:
-        raise ConnectionError(f"more than {LEDGER_PAGES * 100} ledger artifacts: the listing was not read to the end")
+        raise ConnectionError(f"more than {LEDGER_PAGES * 100} ledger artifacts: the listing was not read to the end "
+                              "(delete old ledger artifacts to recover)")
     ours = [a for a in listing if isinstance(a, dict) and a.get("name") == name
             and (a.get("workflow_run") or {}).get("head_branch") == branch
             and (a.get("workflow_run") or {}).get("head_repository_id") == (a.get("workflow_run") or {}).get("repository_id")]
@@ -909,11 +911,14 @@ def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = L
         raise ConnectionError(f"downloading the newest ledger answered {z.status}")
     try:
         with zipfile.ZipFile(io.BytesIO(z.body)) as archive:
-            return json.loads(archive.read("ledger.json")), "found"
+            ledger = json.loads(archive.read("ledger.json"))
     except (zipfile.BadZipFile, zipfile.LargeZipFile, KeyError, ValueError, zlib.error, EOFError, OSError,
             NotImplementedError, RuntimeError):
         # Downloaded but not readable as a ledger: a new baseline replaces it, so it cannot stall runs.
         return "unreadable", "unreadable"
+    if ledger is None:
+        return "unreadable", "unreadable"  # a null document is not "no ledger"
+    return ledger, "found"
 
 
 def indexnow_markdown(record: dict) -> str:
@@ -1054,6 +1059,8 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
                     ledger = json.load(f)
             except (OSError, ValueError):
                 ledger = "unreadable"
+            if ledger is None:
+                ledger = "unreadable"  # a null document is not "no ledger"
         elif args.repo:
             try:
                 ledger, state = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", ""), args.branch,
@@ -1062,18 +1069,22 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
                 print(f"indexnow: the previous ledger could not be read, so nothing is submitted or recorded: {e}",
                       file=sys.stderr)
                 return 2
-        lost = "the previous ledger has expired: starting a new baseline" if state == "expired" else ""
+        lost = {"expired": "the previous ledger has expired: starting a new baseline",
+                "none": "no previous ledger was found: starting a new baseline. That is expected on the first "
+                        "run after adoption; otherwise the ledger was lost (it expired)"}.get(state, "")
         try:
             new, record = indexnow(args.canonical, args.sitemap, args.key, ledger, http, args.sha,
                                    dry_run=args.dry_run, lost=lost)
         except ConnectionError as e:
             print(f"indexnow: unreachable: {e}", file=sys.stderr)
             return 2
-        # The first baseline is planned and silent. One that replaces a lost ledger (expired, corrupt or
-        # invalid, even several runs earlier) means changes since IndexNow last accepted were skipped.
+        # Every baseline that starts from nothing warns, once: no listed ledger (GitHub no longer lists
+        # expired ones, so a first run and an expired ledger look alike), or an expired, corrupt or
+        # invalid one, even several runs earlier. On the first run after adoption that is expected.
         if record.get("unplanned"):
-            print(f"::warning title=IndexNow baseline::{record['host']}: {record['unplanned']}. URLs changed since "
-                  "IndexNow last accepted them were not submitted. The weekly schedule keeps the ledger fresh.")
+            print(f"::warning title=IndexNow baseline::{record['host']}: {record['unplanned']}. Nothing was submitted: "
+                  "after a lost ledger, URLs changed since IndexNow last accepted them were skipped. Check that the "
+                  "weekly schedule is enabled and running.")
         with open(args.ledger_out, "w", encoding="utf-8") as f:
             json.dump(new, f, indent=2, sort_keys=True)
         report = indexnow_markdown(record)
