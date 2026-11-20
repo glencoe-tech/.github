@@ -694,8 +694,13 @@ def eligible(http: "Http", canonical: str, sitemaps: list[str], notes: list[str]
     else:
         robots = rr.text()
     urls: list[str] = []
+    problems: list[dict] = []
     for m in sitemaps:
-        urls += read_sitemap(src, m, [])
+        urls += read_sitemap(src, m, problems)
+    unreadable = [f for f in problems if f["severity"] == "critical"]
+    if unreadable:
+        notes.append(f"a sitemap could not be read ({unreadable[0]['detail']}): nothing is submitted or recorded")
+        return None
     origin = urllib.parse.urlsplit(strict(canonical))[:2]
     pages: dict[str, str] = {}
     for u in dict.fromkeys(urls):
@@ -723,15 +728,26 @@ def eligible(http: "Http", canonical: str, sitemaps: list[str], notes: list[str]
     return pages
 
 
+def _is_time(value) -> bool:
+    try:
+        _when(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _valid_ledger(ledger, h: str) -> tuple[dict | None, str]:
-    """(the ledger, '') when it is a well-formed version-1 ledger for this host, else (None, why)."""
+    """(the ledger, '') when it is a well-formed version-1 ledger for this host, every timestamp
+    included, else (None, why)."""
     if ledger is None:
         return None, ""
     entry_ok = lambda e: (isinstance(e, dict) and isinstance(e.get("fingerprint"), str)  # noqa: E731
-                          and isinstance(e.get("accepted"), str) and isinstance(e.get("attempts"), int))
+                          and isinstance(e.get("accepted"), str) and isinstance(e.get("attempts"), int)
+                          and all(_is_time(e[k]) for k in ("seen", "accepted_at") if k in e))
     if not (isinstance(ledger, dict) and ledger.get("version") == 1 and ledger.get("host") == h
             and isinstance(ledger.get("urls"), dict) and isinstance(ledger.get("log"), list)
-            and isinstance(ledger.get("initialized"), bool) and isinstance(ledger.get("retry_after", ""), str)
+            and isinstance(ledger.get("initialized"), bool)
+            and (ledger.get("retry_after", "") == "" or _is_time(ledger.get("retry_after")))
             and all(isinstance(u, str) and entry_ok(e) for u, e in ledger["urls"].items())):
         return None, "the previous ledger is not a valid version-1 ledger for this host: starting a new baseline"
     return ledger, ""
@@ -741,14 +757,18 @@ def _when(text: str) -> datetime.datetime:
     return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
 
 
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
 def indexnow(canonical: str, sitemaps: list[str], key: str, ledger, http: "Http",
-             sha: str = "", now: str | None = None, dry_run: bool = False) -> tuple[dict, dict]:
+             sha: str = "", now: str | None = None, dry_run: bool = False, clock=_utcnow) -> tuple[dict, dict]:
     """(new ledger, this run's record). Submits only eligible URLs whose fingerprint differs from
     the one IndexNow last accepted. Until a run has recorded a baseline, nothing is submitted, so a
     first run never re-announces a whole site. A URL missing for a while keeps its accepted
     fingerprint, so its return unchanged is not a change. 'accepted' means IndexNow took the URLs;
     it is never proof that anything was crawled or indexed."""
-    now = now or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = now or clock().strftime("%Y-%m-%dT%H:%M:%SZ")
     h = host(canonical)
     record: dict = {"time": now, "sha": sha, "host": h, "submitted": 0, "accepted": 0, "failed": 0,
                     "status": [], "notes": [], "dry_run": dry_run}
@@ -816,26 +836,34 @@ def indexnow(canonical: str, sitemaps: list[str], key: str, ledger, http: "Http"
             else:
                 entry["attempts"] += 1
         record["accepted" if accepted else "failed"] += len(batch)
-        asked = retry_after(r, _when(now))
+        received = clock()  # after any retries inside Http: the wait counts from this response
+        asked = retry_after(r, received)
         if not accepted and asked:
-            new["retry_after"] = (_when(now) + datetime.timedelta(seconds=asked)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            new["retry_after"] = (received + datetime.timedelta(seconds=asked)).strftime("%Y-%m-%dT%H:%M:%SZ")
             record["notes"].append(f"IndexNow answered {r.status} and asked to wait until {new['retry_after']}; the rest wait too")
             break
     return done()
 
 
-def fetch_ledger(http: "Http", repo: str, token: str, branch: str) -> dict | None:
-    """The newest unexpired ledger artifact that a run of this repository's default branch made
-    (never a fork's or another branch's), or None."""
+def ledger_name(canonical: str, workflow: str) -> str:
+    """The ledger artifact's name: one per site and per calling workflow file, so another workflow
+    (or another site in the same workflow) can never hand this one its ledger."""
+    path = workflow.split("@", 1)[0]
+    return f"{LEDGER_ARTIFACT}-{host(canonical)}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"
+
+
+def fetch_ledger(http: "Http", repo: str, token: str, branch: str, name: str = LEDGER_ARTIFACT) -> dict | None:
+    """The newest unexpired ledger artifact with exactly this name that a run of this repository's
+    default branch made (never a fork's or another branch's), or None."""
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={LEDGER_ARTIFACT}&per_page=100", hdrs)
+    r = http.get(f"https://api.github.com/repos/{repo}/actions/artifacts?name={urllib.parse.quote(name)}&per_page=100", hdrs)
     if r.status != 200:
         return None
     try:
         listing = json.loads(r.body).get("artifacts", [])
     except (ValueError, AttributeError):
         return None
-    own = [a for a in listing if isinstance(a, dict) and not a.get("expired")
+    own = [a for a in listing if isinstance(a, dict) and not a.get("expired") and a.get("name") == name
            and (a.get("workflow_run") or {}).get("head_branch") == branch
            and (a.get("workflow_run") or {}).get("head_repository_id") == (a.get("workflow_run") or {}).get("repository_id")]
     if not own:
@@ -966,12 +994,17 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
     n.add_argument("--ledger-in", help="the previous ledger (JSON); omit to fetch it from this repo's artifacts")
     n.add_argument("--repo", default="", help="owner/name, to fetch the previous ledger artifact")
     n.add_argument("--branch", default="", help="the default branch whose runs made the ledger")
+    n.add_argument("--workflow", default="", help="the calling workflow ($GITHUB_WORKFLOW_REF); names the ledger")
+    n.add_argument("--print-ledger-name", action="store_true", help="print the ledger artifact name and exit")
     n.add_argument("--sha", default="")
     n.add_argument("--md", help="append the record as markdown here")
     n.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
     http = http or Http()
 
+    if args.command == "indexnow" and args.print_ledger_name:
+        print(ledger_name(args.canonical, args.workflow))
+        return 0
     if args.command == "indexnow":
         if not args.canonical.startswith("https://") or not args.sitemap or \
                 not re.fullmatch(r"[A-Za-z0-9-]{8,128}", args.key) or (args.repo and not args.branch):
@@ -986,7 +1019,8 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
             except (OSError, ValueError):
                 ledger = "unreadable"
         elif args.repo:
-            ledger = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", ""), args.branch)
+            ledger = fetch_ledger(http, args.repo, env.get("GITHUB_TOKEN", ""), args.branch,
+                                  ledger_name(args.canonical, args.workflow))
         try:
             new, record = indexnow(args.canonical, args.sitemap, args.key, ledger, http, args.sha, dry_run=args.dry_run)
         except ConnectionError as e:

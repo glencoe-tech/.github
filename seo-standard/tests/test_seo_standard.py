@@ -517,6 +517,7 @@ class IndexNow(unittest.TestCase):
 
     def go(self, table, ledger=None, now=None, **kw):
         h, fake = http(table)
+        kw.setdefault("clock", lambda: seo._when(now or self.NOW))
         new, record = seo.indexnow(CANON, [SITEMAP], self.KEY, ledger, h, "abc123", now or self.NOW, **kw)
         return new, record, [json.loads(b) for (k, _), b in zip(fake.calls, fake.bodies) if k == self.POST]
 
@@ -538,6 +539,7 @@ class IndexNow(unittest.TestCase):
         wait, mark = action.index("--wait-only"), action.index('echo "deployed=true" >> "$GITHUB_OUTPUT"')
         self.assertLess(wait, mark)  # written only after the wait returned successfully (set -e)
         self.assertNotIn("seo-standard-deployed", action)  # no shared marker another invocation could leave
+        self.assertIn("name: ${{ steps.indexnow.outputs.name }}", action)  # one ledger per site and workflow
 
     def test_the_hosted_key_is_verified_first_and_a_failed_first_run_is_not_a_baseline(self):
         t = self.site()
@@ -559,6 +561,28 @@ class IndexNow(unittest.TestCase):
             new, record, posts = self.go(t)
             self.assertEqual((posts, new["initialized"]), ([], False))
             self.assertIn("nothing is submitted", record["notes"][0])
+
+    def test_an_unreadable_sitemap_is_never_a_baseline(self):
+        for broken in (R(503), R(200, HOME, content_type="text/html")):
+            t = self.site()
+            t[("GET", SITEMAP)] = broken
+            new, record, posts = self.go(t)
+            self.assertEqual((posts, new["initialized"], new["urls"]), ([], False, {}))
+            self.assertIn("could not be read", record["notes"][-1])
+            after, record, posts = self.go(self.site(), new)
+            self.assertEqual((posts, after["initialized"]), ([], True))  # recovery is the baseline
+
+    def test_invalid_timestamps_start_a_new_baseline(self):
+        good = self.baseline()
+        for field, where in (("seen", "url"), ("accepted_at", "url"), ("retry_after", "ledger")):
+            bad = copy_of(good)
+            target = bad["urls"]["https://example.com/a"] if where == "url" else bad
+            target[field] = "not-a-date"
+            t = self.site()
+            self.change(t)
+            new, record, posts = self.go(t, bad)
+            self.assertEqual(posts, [])
+            self.assertIn("not a valid version-1 ledger", record["notes"][0])
 
     def test_a_baseline_then_only_changed_urls_once(self):
         ledger = self.baseline()
@@ -656,6 +680,9 @@ class IndexNow(unittest.TestCase):
         t[self.POST] = R(429, retry_after="120")
         state, record, posts = self.go(t, state)
         self.assertEqual((len(posts), state["retry_after"]), (1, "2026-11-20T00:02:00Z"))  # one request: no early retry
+        late = seo._when("2026-11-20T00:03:00Z")  # the final 429 arrived after Http's own retries
+        delayed, _, _ = self.go(t, copy_of(state), now="2026-11-20T00:02:30Z", clock=lambda: late)
+        self.assertEqual(delayed["retry_after"], "2026-11-20T00:05:00Z")
         _, deferred, posts = self.go(t, state, now="2026-11-20T00:01:00Z")
         self.assertEqual(posts, [])
         self.assertIn("deferred", deferred["notes"][0])
@@ -712,26 +739,32 @@ class IndexNow(unittest.TestCase):
         with zipfile.ZipFile(buf, "w") as z:
             z.writestr("ledger.json", json.dumps({"version": 1, "from": "main"}))
         run = lambda branch, head=1: {"head_branch": branch, "repository_id": 1, "head_repository_id": head}  # noqa: E731
-        api = "https://api.github.com/repos/o/r/actions/artifacts?name=seo-standard-indexnow-ledger&per_page=100"
-        listing = json.dumps({"artifacts": [
+        name = seo.ledger_name(CANON, "o/r/.github/workflows/seo.yml@refs/heads/main")
+        self.assertEqual(name, seo.ledger_name(CANON, "o/r/.github/workflows/seo.yml@refs/tags/v2"))  # the ref does not matter
+        self.assertNotEqual(name, seo.ledger_name(CANON, "o/r/.github/workflows/other.yml@refs/heads/main"))
+        self.assertNotEqual(name, seo.ledger_name("https://other.example/", "o/r/.github/workflows/seo.yml@refs/heads/main"))
+        api = f"https://api.github.com/repos/o/r/actions/artifacts?name={name}&per_page=100"
+        listing = json.dumps({"artifacts": [{**a, "name": name} if isinstance(a, dict) else a for a in [
             {"expired": True, "created_at": "2026-11-23", "workflow_run": run("main"), "archive_download_url": "https://api.github.com/zip/expired"},
             {"expired": False, "created_at": "2026-11-22", "workflow_run": run("feature"), "archive_download_url": "https://api.github.com/zip/feature"},
             {"expired": False, "created_at": "2026-11-21", "workflow_run": run("main", head=2), "archive_download_url": "https://api.github.com/zip/fork"},
             {"expired": False, "created_at": "2026-11-19", "workflow_run": run("main"), "archive_download_url": "https://api.github.com/zip/old"},
             {"expired": False, "created_at": "2026-11-20", "workflow_run": run("main"), "archive_download_url": "https://api.github.com/zip/new"},
-            "not an artifact"]}).encode()
+            "not an artifact"]] + [{"name": "seo-standard-indexnow-ledger-example.com-otherworkflow", "expired": False,
+                                    "created_at": "2026-11-24", "workflow_run": run("main"),
+                                    "archive_download_url": "https://api.github.com/zip/other-workflow"}]}).encode()
         t = {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(302, location="https://blob.example/z"),
              ("GET", "https://blob.example/z"): R(200, buf.getvalue())}
         h, fake = http(t)
-        self.assertEqual(seo.fetch_ledger(h, "o/r", "tok", "main"), {"version": 1, "from": "main"})
+        self.assertEqual(seo.fetch_ledger(h, "o/r", "tok", "main", name), {"version": 1, "from": "main"})
         self.assertEqual(dict(fake.calls[0][1])["Authorization"], "Bearer tok")
         self.assertNotIn("Authorization", dict(fake.calls[-1][1]))  # never sent to signed storage
         for table in ({("GET", api): R(403)}, {("GET", api): R(200, b"[1]")}, {("GET", api): R(200, b"not json")},
                       {("GET", api): R(200, b'{"artifacts": []}')},
                       {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(410)},
                       {("GET", api): R(200, listing), ("GET", "https://api.github.com/zip/new"): R(200, b"not a zip")}):
-            self.assertIsNone(seo.fetch_ledger(http(table)[0], "o/r", "tok", "main"))
-        self.assertIsNone(seo.fetch_ledger(http({("GET", api): R(200, listing)})[0], "o/r", "tok", "release"))
+            self.assertIsNone(seo.fetch_ledger(http(table)[0], "o/r", "tok", "main", name))
+        self.assertIsNone(seo.fetch_ledger(http({("GET", api): R(200, listing)})[0], "o/r", "tok", "release", name))
 
     def test_cli(self):
         d = tempfile.mkdtemp()
@@ -755,11 +788,16 @@ class IndexNow(unittest.TestCase):
         self.assertEqual(seo.main(base + ["--ledger-in", prev, "--md", md, "--sha", "s"], http(t)[0]), 0)
         with open(md) as f:
             self.assertIn("1 changed URLs submitted, 1 accepted, 0 refused (HTTP 202)", f.read())
-        api = "https://api.github.com/repos/o/r/actions/artifacts?name=seo-standard-indexnow-ledger&per_page=100"
+        wf = "o/r/.github/workflows/seo.yml@refs/heads/main"
+        api = f"https://api.github.com/repos/o/r/actions/artifacts?name={seo.ledger_name(CANON, wf)}&per_page=100"
+        with redirect_stdout(io.StringIO()) as named:
+            self.assertEqual(seo.main(base + ["--workflow", wf, "--print-ledger-name"]), 0)
+        self.assertEqual(named.getvalue().strip(), seo.ledger_name(CANON, wf))
         t2 = self.site()
         t2[("GET", api)] = R(404)
         with redirect_stdout(io.StringIO()):
-            self.assertEqual(seo.main(base + ["--repo", "o/r", "--branch", "main"], http(t2)[0], env={"GITHUB_TOKEN": "t"}), 0)
+            self.assertEqual(seo.main(base + ["--repo", "o/r", "--branch", "main", "--workflow", wf], http(t2)[0],
+                                      env={"GITHUB_TOKEN": "t"}), 0)
         t3 = self.site()
         del t3[("GET", f"https://example.com/{self.KEY}.txt")]
         with redirect_stderr(io.StringIO()):
