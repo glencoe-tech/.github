@@ -1,0 +1,27 @@
+name: discoverability-standard
+description: >-
+  Search and AI-search discoverability check of a built website: robots.txt lets search and
+  AI-search crawlers in, the sitemap lists only real, canonical, indexable pages, and every page
+  serves its title, description, canonical, structured data and text without JavaScript.
+  Reference by full commit SHA: glencoe-tech/.github/discoverability-standard@<sha>.
+
+# A composite action, like hosting-standard: the script that runs is exactly the one at the SHA the
+# caller pinned, read from $GITHUB_ACTION_PATH. Standard-library Python only, no network access.
+
+inputs:
+  dir:
+    description: The built site directory, the files a deploy serves (for example dist or out).
+    required: true
+  origin:
+    description: The production origin the sitemap and canonical links must use, e.g. https://glencoetech.com.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: check search and AI-search discoverability
+      shell: bash
+      env:
+        SITE_DIR: ${{ inputs.dir }}
+        SITE_ORIGIN: ${{ inputs.origin }}
+      run: python3 -I "${GITHUB_ACTION_PATH}/discoverability.py" static "${SITE_DIR}" --origin "${SITE_ORIGIN}"
