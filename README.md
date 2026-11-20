@@ -16,14 +16,17 @@ shared workflows other repositories call. It holds no product code.
 | [`hosting-standard/`](hosting-standard/README.md) | The check behind the right-sized hosting standard: reads every `wrangler` config and the README's `## Hosting` record and fails when the declared tier does not match the config | `repo-minimum-gates.yml`, or a repository directly, pinned by SHA |
 | [`api-contract/`](api-contract/README.md) | The API contract check (GACS-1): validates, lints and compares an OpenAPI 3.1 contract with its last release, and proves a generated SDK reproduces | Repositories that use it, pinned by SHA |
 | [`docs-standard/`](docs-standard/README.md) | The documentation check behind GEDS-001: link integrity, governed-document fields, decision-record ids, documentation impact for high-impact paths, protected-document versions, plus advisory comment and sprawl warnings. Warn-only unless a repository is approved for `enforce` | Repositories that use it, pinned by SHA |
+| [`seo-standard/`](seo-standard/README.md) | The check behind the Website SEO Standard: audits a PR preview as the production site it will become, or the live site after a deploy, and fails only on critical findings (wrong or no indexing) | Public website repositories, pinned by SHA; glencoe-infra's Search Console monitor |
 
-`hosting-standard/`, `api-contract/` and `docs-standard/` each have a self-test workflow
-(`hosting-standard-selftest.yml`, `api-contract-selftest.yml`, `docs-standard-selftest.yml`) that runs on pull requests and on
+`hosting-standard/`, `api-contract/`, `docs-standard/` and `seo-standard/` each have a self-test workflow
+(`hosting-standard-selftest.yml`, `api-contract-selftest.yml`, `docs-standard-selftest.yml`,
+`seo-standard-selftest.yml`) that runs on pull requests and on
 pushes to `main`. To run the tests locally:
 
 ```sh
 python3 -m unittest discover -s hosting-standard/tests
 python3 -m unittest discover -s docs-standard/tests
+python3 -m unittest discover -s seo-standard/tests
 make -C api-contract test        # installs the pinned toolchain, then runs every self-test case
 ```
 
