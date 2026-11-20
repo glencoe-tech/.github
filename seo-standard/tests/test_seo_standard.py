@@ -153,6 +153,11 @@ class Production(unittest.TestCase):
         t[("GET", "https://example.com/")] = R(200, HOME, x_robots_tag="unavailable_after: 2030-01-01, googlebot: none")
         self.assertIn("homepage-noindex-header", codes(run(t), "critical"))
 
+    def test_a_canonical_resolves_against_the_documents_base(self):
+        t = live()
+        t[("GET", "https://example.com/a")] = R(200, page("a", b'<base href="/">'))
+        self.assertEqual(loud(run(t)), [])
+
     def test_a_relative_canonical_resolves_against_the_production_url(self):
         t = live()
         t[("GET", "https://example.com/")] = R(200, page("/"))
@@ -164,10 +169,23 @@ class Production(unittest.TestCase):
         result = run(t)
         self.assertIn("robots-missing", codes(result, "warn"), "a missing robots.txt allows crawling")
         self.assertEqual(codes(result, "critical"), set())
-        t[("GET", "https://example.com/robots.txt")] = R(403)
-        self.assertIn("robots-unreadable", codes(run(t), "critical"))
+        for status in (401, 403):
+            t[("GET", "https://example.com/robots.txt")] = R(status)
+            self.assertEqual((codes(run(t), "critical"), "robots-missing" in codes(run(t), "warn")), (set(), True),
+                             f"{status}: crawlers treat a 4xx robots.txt as allow-all")
+        for status in (429, 503):
+            t[("GET", "https://example.com/robots.txt")] = R(status)
+            self.assertIn("robots-unreadable", codes(run(t), "critical"))
         t[("GET", "https://example.com/robots.txt")] = R(200, b"<!doctype html><html>", content_type="text/html")
         self.assertIn("robots-is-html", codes(run(t), "critical"))
+
+    def test_robots_redirects_are_followed(self):
+        t = live()
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="https://example.com/r/robots.txt")
+        t[("GET", "https://example.com/r/robots.txt")] = R(200, ROBOTS)
+        self.assertEqual(loud(run(t)), [])
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="/robots.txt")
+        self.assertIn("robots-unreadable", codes(run(t), "critical"), "a redirect loop never resolves")
 
     def test_robots_judged_by_content_not_mime(self):
         t = live()
@@ -186,6 +204,12 @@ class Production(unittest.TestCase):
         t = live()
         t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nDisallow: /a\n" + ROBOTS)
         self.assertIn("sitemap-url-disallowed", codes(run(t), "critical"))
+        t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: bingbot\nDisallow: /a\n\n" + ROBOTS)
+        self.assertEqual([f["detail"] for f in run(t)["findings"] if f["code"] == "sitemap-url-disallowed"],
+                         ["https://example.com/a is listed but robots.txt disallows it for bingbot"])
+        t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nDisallow: /\n\nUser-agent: googlebot\n"
+                                                         b"Disallow:\n\nUser-agent: bingbot\nDisallow:\n")
+        self.assertNotIn("robots-blocks-search", codes(run(t)), "a crawler's own empty group overrides *")
         t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nSitemap: https://example.com/o.xml\n")
         self.assertIn("sitemap-not-in-robots", codes(run(t), "warn"))
         t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nAllow: /\n")
@@ -354,9 +378,15 @@ class Parsing(unittest.TestCase):
         self.assertFalse(seo.allowed("User-agent: Googlebot # g\nUser-agent: Bingbot\nDisallow: /\n", "bingbot"))
         self.assertFalse(seo.allowed("User-agent: *\nDisallow: /*.pdf$\n", "googlebot", "/a.pdf"))
         self.assertTrue(seo.allowed("User-agent: *\nDisallow: /*.pdf$\n", "googlebot", "/a.pdf.html"))
+        self.assertTrue(seo.allowed("User-agent: *\nDisallow: /a\nAllow: /a?ok=1\n", "googlebot", "/a?ok=1"),
+                        "the query is part of what is matched")
+        self.assertFalse(seo.allowed("User-agent: *\nDisallow: /a\n", "googlebot", "/%61"), "%61 is a")
+        self.assertFalse(seo.allowed("User-agent: *\nDisallow: /%7Ex\n", "googlebot", "/~x"))
+        self.assertTrue(seo.allowed("User-agent: *\nDisallow: /a/b\n", "googlebot", "/a%2Fb"), "%2F stays reserved")
         self.assertEqual(seo.robots_sitemaps("sitemap: https://x/a.xml\n"), ["https://x/a.xml"])
 
     def test_page_and_helpers(self):
+        self.assertTrue(seo.noindex("noindex nofollow"))
         p = seo.Page('<meta name="googlebot" content="NONE"><link rel="alternate" href="x"><meta content="x">')
         self.assertTrue(seo.noindex(p.robots))
         self.assertEqual(p.canonical, "")
@@ -383,9 +413,8 @@ class Parsing(unittest.TestCase):
 
 
 class DiscoverabilityGaps(unittest.TestCase):
-    """The rules ported from the reviewed discoverability check (glencoe-tech/.github#28, closed as
-    superseded): served content, soft 404s, #fragment sitemap URLs, robots.txt redirects,
-    percent-encoded robots paths, and query strings in sampled robots paths."""
+    """Served content, soft 404s, #fragment sitemap URLs and even sitemap sampling, from the
+    reviewed discoverability check (glencoe-tech/.github#28, closed as superseded). All warnings."""
 
     SHELL = (b'<!doctype html><html><head><title>Shell</title><link rel="canonical" href="https://example.com/">'
              b'<meta name="description" content="d"></head><body><div id="root"></div>'
@@ -397,9 +426,9 @@ class DiscoverabilityGaps(unittest.TestCase):
         t[("GET", "https://example.com/")] = R(200, self.SHELL, content_type="text/html")
         result = run(t)
         shells = [f for f in result["findings"] if f["code"] == "served-content-empty"]
-        self.assertEqual([f["severity"] for f in shells], ["warn"])  # homepage once, though sampled too
-        self.assertEqual(result["facts"]["served_words"], 0)
-        self.assertEqual(codes(run(t), "critical"), set())
+        self.assertEqual([f["severity"] for f in shells], ["warn"])  # the homepage once, though sampled too
+        self.assertEqual(result["facts"]["served_words"], 13)  # the <noscript> notice is served text, still a shell
+        self.assertEqual(codes(result, "critical"), set())
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         with open(os.path.join(d, "index.html"), "wb") as fh:
@@ -413,8 +442,12 @@ class DiscoverabilityGaps(unittest.TestCase):
         unclosed = "<html><head><title>t</title><meta name=x content=y>" + " ".join(["w"] * 60)
         self.assertEqual(seo.Page(unclosed).words, 60)
         self.assertEqual(seo.Page("<head></head><body></noscript>a b</body>").words, 2)
+        self.assertEqual(seo.Page("<p>wo<span>rd</span> two</p><p>three</p>").text, "word two three")
+        self.assertEqual(seo.Page("<head>\n  <title>t</title>\n</head><body>x</body>").words, 1)  # head whitespace is not text
+        fallback = "<body><noscript><h1>Welcome</h1><p>Our site works without JavaScript.</p></noscript></body>"
+        self.assertEqual((seo.Page(fallback).h1, seo.Page(fallback).words), (1, 6))  # noscript is served text
         t = live()
-        t[("GET", "https://example.com/a")] = R(200, form.replace(b"Three short steps.", b"Short."), content_type="text/html")
+        t[("GET", "https://example.com/a")] = R(200, form, content_type="text/html")
         self.assertNotIn("served-content-empty", codes(run(t)))
 
     def test_soft_404(self):
@@ -426,51 +459,29 @@ class DiscoverabilityGaps(unittest.TestCase):
         self.assertNotIn("soft-404", codes(result))
         self.assertNotIn("unauditable", result)
 
-    def test_fragment_sitemap_urls(self):
+    def test_fragment_sitemap_urls_are_reported_and_not_sampled(self):
         t = live()
         t[("GET", SITEMAP)] = R(200, URLSET.replace(b"https://example.com/a<", b"https://example.com/#a<"), content_type="application/xml")
         result = run(t)
         self.assertIn("sitemap-url-fragment", codes(result, "warn"))
         self.assertEqual(codes(result, "critical"), set())
 
-    def test_robots_redirects(self):
+    def test_samples_spread_across_the_whole_sitemap(self):
+        urls = [f"u{i}" for i in range(100)]
+        picked = seo.spread(urls, 20)
+        self.assertEqual((len(picked), picked[0], picked[-1], len(set(picked))), (20, "u0", "u99", 20))
+        self.assertEqual(seo.spread(urls[:3], 20), urls[:3])
+        self.assertEqual(seo.SAMPLE_URLS["preview"], 5)
+        # silverbackmoving.ca's shape: the noindex page is URL 7 of 18, which a first-5 sample missed.
+        locs = [f"https://example.com/p{i}" for i in range(18)]
         t = live()
-        t[("GET", "https://example.com/robots.txt")] = R(301, location="/rules/start")
-        t[("GET", "https://example.com/rules/start")] = R(302, location="robots.txt")
-        t[("GET", "https://example.com/rules/robots.txt")] = R(200, b"User-agent: *\nDisallow: /\n", content_type="text/plain")
-        self.assertIn("robots-blocks-search", codes(run(t), "critical"))  # each hop resolves against the last
-        t[("GET", "https://example.com/robots.txt")] = R(301, location="/rules,production.txt")
-        t[("GET", "https://example.com/rules,production.txt")] = R(200, b"User-agent: *\nDisallow: /\n", content_type="text/plain")
-        self.assertIn("robots-blocks-search", codes(run(t), "critical"))  # a comma is part of the URL
-        for n in range(seo.ROBOTS_REDIRECTS):  # exactly five redirects still reach the rules
-            t[("GET", f"https://example.com/hop{n}")] = R(301, location=f"/hop{n + 1}")
-        t[("GET", "https://example.com/robots.txt")] = R(301, location="/hop1")
-        t[("GET", f"https://example.com/hop{seo.ROBOTS_REDIRECTS}")] = R(200, b"User-agent: *\nDisallow: /\n", content_type="text/plain")
-        self.assertIn("robots-blocks-search", codes(run(t), "critical"))
-        t[("GET", "https://example.com/robots.txt")] = R(302, location="/robots.txt")
-        loop = run(t)
-        self.assertTrue({"robots-redirect-loop", "robots-missing"} <= codes(loop, "warn"))
-        self.assertNotIn("robots-blocks-search", codes(loop))
-        for target in ("https://[invalid/robots.txt", "https://example.com:bad/r.txt", "mailto:x@example.com"):
-            t[("GET", "https://example.com/robots.txt")] = R(302, location=target)
-            self.assertIn("robots-redirect-invalid", codes(run(t), "warn"), target)
-        t[("GET", "https://example.com/robots.txt")] = R(301, location="https://gone.example.net/robots.txt")
-        self.assertIn("robots-unreadable", codes(run(t), "critical"))  # unreachable: treat as disallow-all
-
-    def test_percent_encoded_paths_and_queries(self):
-        rules = "User-agent: *\nDisallow: /private\nDisallow: /caf\u00e9\nDisallow: /a%2fb\nDisallow: /search?\n"
-        self.assertFalse(seo.allowed(rules, "googlebot", "/%70rivate"))
-        self.assertFalse(seo.allowed(rules, "googlebot", "/caf%c3%a9/menu"))
-        self.assertFalse(seo.allowed(rules, "googlebot", "/a%2Fb"))  # a reserved escape keeps its meaning
-        self.assertTrue(seo.allowed(rules, "googlebot", "/a/b"))
-        self.assertEqual(seo.octets("/%7euser/%zz"), "/~user/%zz")
-        # RFC 9309 2.2.2: the most specific rule has the most octets, so /* (2) beats / (1).
-        self.assertFalse(seo.allowed("User-agent: *\nAllow: /\nDisallow: /*\n", "googlebot", "/x"))
-        t = live()
-        t[("GET", "https://example.com/robots.txt")] = R(200, ROBOTS + b"Disallow: /search?\n", content_type="text/plain")
-        t[("GET", SITEMAP)] = R(200, URLSET.replace(b"https://example.com/a<", b"https://example.com/search?q=1<"), content_type="application/xml")
-        t[("GET", "https://example.com/search?q=1")] = R(200, page("https://example.com/search?q=1"), content_type="text/html")
-        self.assertIn("sitemap-url-disallowed", codes(run(t), "critical"))
+        t[("GET", SITEMAP)] = R(200, b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                                + b"".join(b"<url><loc>" + u.encode() + b"</loc></url>" for u in locs) + b"</urlset>",
+                                content_type="application/xml")
+        for i, u in enumerate(locs):
+            extra = b'<meta name="robots" content="noindex">' if i == 6 else b""
+            t[("GET", u)] = R(200, page(u, extra), content_type="text/html")
+        self.assertIn("sitemap-url-noindex", codes(run(t), "critical"))
 
 
 class PreviewResolution(unittest.TestCase):
@@ -511,13 +522,24 @@ class PreviewResolution(unittest.TestCase):
         h, _ = self.api({"check_runs": [old_ok, running]},
                         {"check_runs": [old_ok, dict(running, status="completed", conclusion="success")]})
         self.assertEqual(self.wait(h)["id"], 3, "a newer running deploy is waited for, not the older success")
+        queued = {"id": 4, "started_at": None, "status": "queued"}
+        h, _ = self.api({"check_runs": [old_ok, queued]},
+                        {"check_runs": [old_ok, dict(queued, status="completed", conclusion="failure")]})
+        with self.assertRaisesRegex(RuntimeError, "concluded failure"):
+            self.wait(h)
+
+    def test_requests_never_outlast_the_deadline(self):
+        h, _ = self.api({"check_runs": [self.WORKERS]})
+        h.timeout = 20
+        seo.wait_for_check(h, "o/r", "abc", "Workers Builds: peeps-web", "t", 5, 1, iter([0, 1, 2]).__next__, lambda s: None)
+        self.assertEqual(h.timeout, 4)
 
     def test_every_page_of_the_listing_is_read(self):
         page2 = self.URL + "&page=2"
         h, _ = http({("GET", self.URL): R(200, json.dumps({"check_runs": [dict(self.WORKERS, started_at="1")]}).encode(),
                                           link=f'<{page2}>; rel="next"'),
                      ("GET", page2): R(200, json.dumps({"check_runs": [dict(self.PAGES, started_at="2")]}).encode())})
-        self.assertEqual(self.wait(h)["id"], 1)
+        self.assertEqual(self.wait(h)["id"], 2, "the highest id across every page")
 
     def test_failure_timeout_and_api_errors(self):
         h, _ = self.api({"check_runs": [{"status": "completed", "conclusion": "failure"}]})
