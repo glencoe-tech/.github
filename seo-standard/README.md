@@ -52,12 +52,18 @@ their own.
 
 **Critical (the run fails):**
 - the homepage is not 200
-- `noindex` in production (X-Robots-Tag or meta)
-- `robots.txt` disallows the whole site for Googlebot or Bingbot
-- `robots.txt` or a sitemap is an HTML page (the SPA fallback)
-- a sitemap that is missing, invalid, not a sitemap, or lists URLs on another host
-- a sampled sitemap URL that is not a 200 (redirects count), or is `noindex`
-- `rel=canonical` pointing anywhere but the production URL
+- `noindex` in production. Meta robots, or an `X-Robots-Tag` that applies to Googlebot or
+  Bingbot; a tag scoped to another crawler, e.g. `googlebot-news:`, does not count
+- `robots.txt` disallows the homepage for Googlebot or Bingbot (RFC 9309 matching: wildcards,
+  `$`, longest rule wins, Allow wins a tie), or answers 5xx/401/403 (Google then crawls nothing)
+- `robots.txt` or a sitemap whose body is an HTML page (the SPA fallback)
+- a sitemap that is missing, invalid XML, not a sitemap, or lists URLs on another host
+- a sampled sitemap URL that is:
+  - not a 200 (redirects count)
+  - `noindex`
+  - disallowed by robots.txt
+  - declaring another page as its canonical
+- the homepage's `rel=canonical` pointing anywhere but the production URL
 - `http://` or the other `www` form not ending at the canonical URL
 - a declared private host answering 200 without `noindex`
 
@@ -65,6 +71,8 @@ their own.
 - missing title, description, Open Graph tags, rel=canonical or meta viewport
 - invalid JSON-LD
 - a temporary (non-301/308) host redirect
+- no `robots.txt` at all (404): crawlers treat it as allow-all, but it should name the sitemap
+- valid `robots.txt` or sitemap XML served with an HTML content type
 - robots naming no sitemap, or not naming the declared one
 - an AI search crawler blocked (`OAI-SearchBot`, `PerplexityBot`, `Claude-SearchBot`, …)
 - an empty sitemap
@@ -92,5 +100,11 @@ python3 seo-standard/seo_standard.py audit --mode preview --base https://<previe
 python3 -m unittest discover -s seo-standard/tests
 ```
 
-Exit codes: 0 passed, 1 critical findings, 2 could not run. The check fails closed: bad
-arguments, a deploy check that failed or never finished, or no preview URL all exit 2.
+Exit codes: 0 passed, 1 critical findings, 2 could not run. The check fails closed. These all
+exit 2, never 1, because a check that verified nothing is not a verdict on the site:
+- bad arguments
+- a deploy check that failed or never finished, or no preview URL
+- an unreachable site
+- a preview behind a login (Access)
+
+When a deploy is re-run, the newest check run counts.

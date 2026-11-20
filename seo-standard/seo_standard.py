@@ -7,17 +7,17 @@
 
 Modes of `audit`:
   production  the live site: redirects, status, indexing directives, robots.txt, sitemaps and the
-              URLs they list, canonical, metadata, structured data, private hosts, crawler access
+              URLs they list, canonicals, metadata, structured data, private hosts, crawler access
   preview     a PR preview at --base, judged as the production site it will become: canonicals and
               sitemap URLs must name the PRODUCTION host; previews are expected to be noindex
   artifact    a static build directory (--dist): robots.txt, sitemap files and the homepage markup
 
 Severity: critical findings fail (exit 1): the site would be wrongly indexed or not indexed at all.
-warn findings are annotations and never fail. info is context. Exit 2: the check could not run
-(it fails closed: a check that verified nothing is not a pass).
+warn findings are annotations and never fail. info is context. Exit 2: the check could not run or
+could not reach the site (it fails closed, and never reports an unreachable site as an SEO defect).
 
-Standard-library Python 3.11+. Used by the composite action in this directory, by the reusable
-workflow .github/workflows/seo-standard.yml, and by glencoe-infra's Search Console monitor.
+Standard-library Python 3.11+. Used by the composite action in this directory and by
+glencoe-infra's Search Console monitor.
 """
 from __future__ import annotations
 
@@ -45,6 +45,13 @@ AI_SEARCH_CRAWLERS = ("oai-searchbot", "chatgpt-user", "perplexitybot", "perplex
                       "claude-searchbot", "claude-user", "applebot", "duckduckbot")
 # Crawlers that collect training data. Blocking them is a legitimate per-client choice.
 TRAINING_CRAWLERS = ("gptbot", "google-extended", "ccbot", "claudebot", "applebot-extended", "bytespider")
+# Robots directives that themselves contain a colon, so `name: value` is not a crawler scope.
+COLON_DIRECTIVES = {"unavailable_after", "max-snippet", "max-image-preview", "max-video-preview"}
+
+
+class Unauditable(Exception):
+    """The site could not be audited (unreachable, or a preview behind a login). Exit 2, never a
+    critical finding: a check that verified nothing is not a verdict on the site."""
 
 
 # --- HTTP ----------------------------------------------------------------------------------------
@@ -68,12 +75,21 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
+def headers_of(items) -> dict:
+    """Lower-cased headers; a repeated header's values are kept one per line (X-Robots-Tag)."""
+    out: dict[str, str] = {}
+    for k, v in items:
+        k = k.lower()
+        out[k] = f"{out[k]}\n{v}" if k in out else v
+    return out
+
+
 def _send(req: urllib.request.Request, timeout: float) -> Response:  # pragma: no cover - real network
     try:
         with _OPENER.open(req, timeout=timeout) as r:
-            return Response(r.status, {k.lower(): v for k, v in r.headers.items()}, r.read(5_000_000), r.url)
+            return Response(r.status, headers_of(r.headers.items()), r.read(5_000_000), r.url)
     except urllib.error.HTTPError as e:
-        return Response(e.code, {k.lower(): v for k, v in e.headers.items()}, e.read(5_000_000), req.full_url)
+        return Response(e.code, headers_of(e.headers.items()), e.read(5_000_000), req.full_url)
 
 
 class Http:
@@ -136,8 +152,8 @@ class Page(html.parser.HTMLParser):
             self.canonical = self.canonical or a.get("href", "")
         elif tag == "meta":
             key = (a.get("name") or a.get("property") or "").lower()
-            if key in ("robots", "googlebot"):
-                self.robots += " " + a.get("content", "").lower()
+            if key in ("robots", "googlebot", "bingbot"):
+                self.robots += "," + a.get("content", "").lower()
             elif key == "viewport":
                 self.viewport = True
             elif key:
@@ -160,7 +176,22 @@ class Page(html.parser.HTMLParser):
 
 
 def noindex(directives: str) -> bool:
-    return bool(re.search(r"\b(noindex|none)\b", directives.lower()))
+    """`noindex` or `none` among comma-separated meta robots directives."""
+    return any(d.strip() in ("noindex", "none") for d in directives.lower().split(","))
+
+
+def header_noindex(value: str, agents=SEARCH_CRAWLERS) -> bool:
+    """X-Robots-Tag: true when a directive applying to a search crawler is noindex. `name: ...`
+    scopes the directives after it (on that header line) to one crawler; others are ignored."""
+    for line in value.lower().splitlines():
+        scope = None
+        for part in line.split(","):
+            m = re.match(r"\s*([a-z0-9_.-]+)\s*:\s*(.*)$", part)
+            if m and m.group(1) not in COLON_DIRECTIVES:
+                scope, part = m.group(1), m.group(2)
+            if part.strip() in ("noindex", "none") and (scope is None or scope in agents):
+                return True
+    return False
 
 
 def host(url: str) -> str:
@@ -172,11 +203,13 @@ def norm(url: str) -> str:
     return urllib.parse.urlunsplit((p.scheme, (p.hostname or "").lower(), p.path or "/", p.query, ""))
 
 
-def robots_groups(text: str) -> list[tuple[set[str], list[str]]]:
-    """[(user agents, rules)] in file order; a rule is 'allow:<path>' or 'disallow:<path>'."""
-    groups: list[tuple[set[str], list[str]]] = []
+def robots_groups(text: str) -> list[tuple[set[str], list[tuple[bool, str]]]]:
+    """[(user agents, [(allow, path pattern)])] in file order. Consecutive user-agent lines form one
+    group; an empty Disallow is no rule."""
+    groups: list[tuple[set[str], list[tuple[bool, str]]]] = []
     agents: set[str] = set()
-    rules: list[str] = []
+    rules: list[tuple[bool, str]] = []
+    seen_rule = False
     for raw in text.splitlines():
         line = raw.split("#", 1)[0].strip()
         if ":" not in line:
@@ -184,22 +217,37 @@ def robots_groups(text: str) -> list[tuple[set[str], list[str]]]:
         k, v = (x.strip() for x in line.split(":", 1))
         k = k.lower()
         if k == "user-agent":
-            if rules:
+            if seen_rule:
                 groups.append((agents, rules))
-                agents, rules = set(), []
+                agents, rules, seen_rule = set(), [], False
             agents.add(v.lower())
         elif k in ("allow", "disallow"):
-            rules.append(f"{k}:{v}")
+            seen_rule = True
+            if v:
+                rules.append((k == "allow", v))
     groups.append((agents, rules))
     return groups
 
 
-def blocked(text: str, agent: str) -> bool:
-    """True when the group that applies to `agent` (its own group, else `*`) disallows everything."""
+def _pattern(path: str) -> re.Pattern:
+    anchored = path.endswith("$")
+    body = re.escape(path[:-1] if anchored else path).replace(r"\*", ".*")
+    return re.compile(body + ("$" if anchored else ""))
+
+
+def allowed(text: str, agent: str, path: str = "/") -> bool:
+    """Google's robots.txt evaluation (RFC 9309): the agent's own groups (else `*`), the longest
+    matching rule wins, and Allow wins a tie. No matching rule: allowed."""
     groups = robots_groups(text)
-    own = [r for a, r in groups if agent in a]
-    rules = [x for r in (own or [r for a, r in groups if "*" in a]) for x in r]
-    return "disallow:/" in rules and not any(r.startswith("allow:") and r != "allow:" for r in rules)
+    rules = [r for a, rs in groups if agent in a for r in rs] or \
+            [r for a, rs in groups if "*" in a for r in rs]
+    best: tuple[int, bool] | None = None
+    for allow, pat in rules:
+        if _pattern(pat).match(path):
+            key = (len(pat), allow)
+            if best is None or key > best:
+                best = key
+    return best is None or best[1]
 
 
 def robots_sitemaps(text: str) -> list[str]:
@@ -207,9 +255,10 @@ def robots_sitemaps(text: str) -> list[str]:
             if line.strip().lower().startswith("sitemap:")]
 
 
-def is_html(r: Response) -> bool:
-    return "html" in r.header("content-type").lower() or r.body.lstrip()[:15].lower().startswith(
-        (b"<!doctype html", b"<html"))
+def looks_html(body: bytes) -> bool:
+    """The body is an HTML document (a framework's fallback page), judged by content, not MIME."""
+    head = body.lstrip(b"\xef\xbb\xbf \t\r\n")[:1024].lower()
+    return head.startswith((b"<!doctype html", b"<html")) or (b"<html" in head and b"<head" in head)
 
 
 def finding(severity: str, code: str, detail: str) -> dict:
@@ -219,18 +268,22 @@ def finding(severity: str, code: str, detail: str) -> dict:
 # --- sources: where the files come from ----------------------------------------------------------
 
 class Live:
-    """Files fetched over HTTP. In preview mode `base` replaces the production origin, and requests
-    are browser navigations: a Workers preview serves a single-page app's fallback only to
-    `Sec-Fetch-Mode: navigate`, where production serves every client (measured 2026-11-20)."""
+    """Files fetched over HTTP. In preview mode URLs on the production host are fetched from `base`
+    instead, as browser navigations: a Workers preview serves a single-page app's fallback only to
+    `Sec-Fetch-Mode: navigate`, where production serves every client (measured 2026-11-20). Any
+    other URL is fetched exactly as given."""
 
     def __init__(self, http: Http, canonical: str, base: str | None = None):
         self.http = http
-        self.origin = (base or canonical).rstrip("/")
+        self.prod = host(canonical)
+        self.base = base.rstrip("/") if base else None
         self.headers = {"Sec-Fetch-Mode": "navigate", "Accept": "text/html,*/*"} if base else None
 
     def url(self, production_url: str) -> str:
+        if not self.base or host(production_url) != self.prod:
+            return production_url
         p = urllib.parse.urlsplit(production_url)
-        return self.origin + (p.path or "/") + (f"?{p.query}" if p.query else "")
+        return self.base + (p.path or "/") + (f"?{p.query}" if p.query else "")
 
     def get(self, production_url: str) -> Response:
         return self.http.get(self.url(production_url), self.headers)
@@ -265,14 +318,16 @@ def read_sitemap(src, url: str, out: list[dict], depth: int = 0) -> list[str]:
     if r.status != 200:
         out.append(finding("critical", "sitemap-unreachable", f"{url} answered {r.status}"))
         return []
-    if is_html(r):
-        out.append(finding("critical", "sitemap-is-html", f"{url} returns an HTML page, not XML"))
-        return []
     try:
         root = ET.fromstring(r.body)
     except ET.ParseError as e:
-        out.append(finding("critical", "sitemap-invalid-xml", f"{url}: {e}"))
+        if looks_html(r.body):
+            out.append(finding("critical", "sitemap-is-html", f"{url} returns an HTML page, not XML"))
+        else:
+            out.append(finding("critical", "sitemap-invalid-xml", f"{url}: {e}"))
         return []
+    if "html" in r.header("content-type").lower():
+        out.append(finding("warn", "sitemap-content-type", f"{url} is XML served as {r.header('content-type')}"))
     locs = [(e.text or "").strip() for e in root.iter(f"{SM}loc")]
     if root.tag == f"{SM}sitemapindex":
         if depth:
@@ -309,7 +364,7 @@ def _redirects(http: Http, canonical: str, out: list[dict]) -> None:
 
 def _homepage(r: Response, canonical: str, mode: str, out: list[dict], facts: dict) -> None:
     indexing = "info" if mode == "preview" else "critical"
-    if noindex(r.header("x-robots-tag")):
+    if header_noindex(r.header("x-robots-tag")):
         out.append(finding(indexing, "homepage-noindex-header", f"X-Robots-Tag: {r.header('x-robots-tag')}"))
     page = Page(r.text())
     facts["title"] = page.title.strip()[:120]
@@ -339,33 +394,60 @@ def _homepage(r: Response, canonical: str, mode: str, out: list[dict], facts: di
             out.append(finding("warn", "structured-data-invalid", "a JSON-LD block is not valid JSON"))
 
 
-def _robots(r: Response, mode: str, out: list[dict], facts: dict) -> list[str]:
+def _robots(r: Response, mode: str, out: list[dict], facts: dict) -> str:
+    """The robots.txt text crawlers obey ('' when none: everything is allowed)."""
+    if r.status in (404, 410):
+        out.append(finding("warn", "robots-missing", f"robots.txt answered {r.status}: crawlers treat that as "
+                           "allow-all, but it should name the sitemap"))
+        return ""
     if r.status != 200:
-        out.append(finding("critical" if mode != "artifact" else "warn", "robots-missing",
-                           f"robots.txt answered {r.status}"))
-        return []
-    if is_html(r):
+        # Google treats an unreachable robots.txt (5xx) as disallow-all until it can read one.
+        out.append(finding("critical", "robots-unreadable", f"robots.txt answered {r.status}"))
+        return ""
+    if looks_html(r.body):
         out.append(finding("critical", "robots-is-html", "robots.txt returns an HTML page"))
-        return []
+        return ""
+    if "html" in r.header("content-type").lower():
+        out.append(finding("warn", "robots-content-type", f"robots.txt is served as {r.header('content-type')}"))
     text = r.text()
     for agent in SEARCH_CRAWLERS:
-        if blocked(text, agent):
+        if not allowed(text, agent, "/"):
             out.append(finding("info" if mode == "preview" else "critical", "robots-blocks-search",
-                               f"robots.txt disallows the whole site for {agent}"))
-    ai = [a for a in AI_SEARCH_CRAWLERS if blocked(text, a)]
+                               f"robots.txt disallows the homepage for {agent}"))
+    ai = [a for a in AI_SEARCH_CRAWLERS if not allowed(text, a, "/")]
     if ai and mode != "preview":
         out.append(finding("warn", "robots-blocks-ai-search", "hidden from AI search: " + ", ".join(ai)))
-    facts["blocks_training_crawlers"] = [a for a in TRAINING_CRAWLERS if blocked(text, a)]
+    facts["blocks_training_crawlers"] = [a for a in TRAINING_CRAWLERS if not allowed(text, a, "/")]
     declared = robots_sitemaps(text)
     if not declared:
         out.append(finding("warn", "robots-no-sitemap", "robots.txt names no Sitemap"))
     facts["robots_sitemaps"] = declared
-    return declared
+    return text
+
+
+def _sampled(src, mode: str, robots: str, urls: list[str], out: list[dict]) -> None:
+    for u in urls[:SAMPLE_URLS]:
+        path = urllib.parse.urlsplit(u).path or "/"
+        if robots and mode != "preview" and not allowed(robots, "googlebot", path):
+            out.append(finding("critical", "sitemap-url-disallowed", f"{u} is listed but robots.txt disallows it"))
+        s = src.get(u)
+        if s.status == 404 and mode == "artifact":
+            out.append(finding("info", "sitemap-url-not-static", f"{u} is not a file in the build (rendered at runtime?)"))
+            continue
+        if s.status != 200:
+            out.append(finding("critical", "sitemap-url-status", f"{u} answered {s.status}"))
+            continue
+        page = Page(s.text())
+        if mode != "preview" and (header_noindex(s.header("x-robots-tag")) or noindex(page.robots)):
+            out.append(finding("critical", "sitemap-url-noindex", f"{u} is noindex but listed in the sitemap"))
+        if page.canonical and norm(urllib.parse.urljoin(u, page.canonical)) != norm(u):
+            out.append(finding("critical", "sitemap-url-canonical-elsewhere",
+                               f"{u} declares rel=canonical {page.canonical}: list only canonical URLs"))
 
 
 def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mode: str = "production",
           http: Http | None = None, base: str | None = None, dist: str | None = None) -> dict:
-    """Findings and facts for one site. Network failures are findings, never crashes."""
+    """{"findings", "facts"} for one site, plus "unauditable" (a reason) when it could not be checked."""
     http = http or Http()
     out: list[dict] = []
     facts: dict = {"canonical": canonical, "mode": mode}
@@ -375,6 +457,9 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
             _redirects(http, canonical, out)
         r = src.get(canonical)
         facts["status"] = r.status
+        if mode == "preview" and (r.status in (401, 403) or (r.status in REDIRECTS and
+                                                             "cloudflareaccess.com" in r.header("location"))):
+            raise Unauditable(f"the preview answers {r.status} (behind a login?): it cannot be audited")
         if r.status != 200:
             out.append(finding("critical", "homepage-status", f"{canonical} answered {r.status}"))
             if r.header("cf-mitigated") or r.status == 403:
@@ -382,7 +467,8 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
                                    "Googlebot is allowed with URL Inspection"))
             return {"findings": out, "facts": facts}
         _homepage(r, canonical, mode, out, facts)
-        declared = _robots(src.get(f"https://{host(canonical)}/robots.txt"), mode, out, facts)
+        robots = _robots(src.get(f"https://{host(canonical)}/robots.txt"), mode, out, facts)
+        declared = facts.get("robots_sitemaps", [])
         for m in sitemaps:
             if declared and m not in declared:
                 out.append(finding("warn", "sitemap-not-in-robots", f"{m} is not named in robots.txt"))
@@ -394,24 +480,19 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
         if off:
             out.append(finding("critical", "sitemap-off-host",
                                f"{len(off)} URLs not on https://{host(canonical)}, e.g. {off[0]}"))
-        for u in [u for u in urls if u not in off][:SAMPLE_URLS]:
-            s = src.get(u)
-            if s.status == 404 and mode == "artifact":
-                out.append(finding("info", "sitemap-url-not-static", f"{u} is not a file in the build (rendered at runtime?)"))
-            elif s.status != 200:
-                out.append(finding("critical", "sitemap-url-status", f"{u} answered {s.status}"))
-            elif mode != "preview" and (noindex(s.header("x-robots-tag")) or noindex(Page(s.text()).robots)):
-                out.append(finding("critical", "sitemap-url-noindex", f"{u} is noindex but listed in the sitemap"))
+        _sampled(src, mode, robots, [u for u in urls if u not in off], out)
         if mode == "production":
             for h in private_hosts:
                 try:
                     p = http.get(f"https://{h}/")
                 except ConnectionError:
                     continue
-                if p.status == 200 and not (noindex(p.header("x-robots-tag")) or noindex(Page(p.text()).robots)):
+                if p.status == 200 and not (header_noindex(p.header("x-robots-tag")) or noindex(Page(p.text()).robots)):
                     out.append(finding("critical", "private-host-indexable", f"{h} answers 200 without noindex"))
     except ConnectionError as e:
-        out.append(finding("critical", "unreachable", str(e)))
+        return {"findings": out, "facts": facts, "unauditable": f"unreachable: {e}"}
+    except Unauditable as e:
+        return {"findings": out, "facts": facts, "unauditable": str(e)}
     return {"findings": out, "facts": facts}
 
 
@@ -419,6 +500,7 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
 
 PAGES_PREVIEW = re.compile(r"Preview URL:.*?href=['\"](https://[^'\"]+)['\"]", re.S)
 WORKERS_BUILD = re.compile(r"/workers/services/view/([^/]+)/[^/]+/previews/([^/]+)/builds/")
+NEXT_LINK = re.compile(r'<([^>]+)>;\s*rel="next"')
 
 
 def preview_url(run: dict, workers_subdomain: str = "") -> str | None:
@@ -432,25 +514,36 @@ def preview_url(run: dict, workers_subdomain: str = "") -> str | None:
     return None
 
 
-def wait_for_check(http: Http, repo: str, sha: str, name: str, token: str, timeout: float = 900,
-                   interval: float = 15, clock=time.monotonic, sleep=time.sleep) -> dict:
-    """The completed check run `name` on `sha`; raises RuntimeError on failure or timeout."""
-    url = (f"https://api.github.com/repos/{repo}/commits/{sha}/check-runs?"
-           + urllib.parse.urlencode({"check_name": name}))
-    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    deadline = clock() + timeout
-    while True:
+def latest_run(http: Http, url: str, hdrs: dict) -> dict | None:
+    """The newest check run of every page of the listing (a re-run supersedes the runs before it)."""
+    runs: list[dict] = []
+    while url:
         r = http.get(url, hdrs)
         if r.status != 200:
             raise RuntimeError(f"reading check runs answered {r.status}")
-        runs = json.loads(r.body).get("check_runs", [])
-        done = [c for c in runs if c.get("status") == "completed"]
-        if done:
-            run = done[0]
+        runs += json.loads(r.body).get("check_runs", [])
+        m = NEXT_LINK.search(r.header("link"))
+        url = m.group(1) if m else ""
+    return max(runs, key=lambda c: (c.get("started_at") or "", c.get("id") or 0), default=None)
+
+
+def wait_for_check(http: Http, repo: str, sha: str, name: str, token: str, timeout: float = 900,
+                   interval: float = 15, clock=time.monotonic, sleep=time.sleep) -> dict:
+    """The newest check run `name` on `sha`, once complete; RuntimeError on failure or timeout."""
+    url = (f"https://api.github.com/repos/{repo}/commits/{sha}/check-runs?"
+           + urllib.parse.urlencode({"check_name": name, "filter": "all", "per_page": 100}))
+    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    deadline = clock() + timeout
+    while True:
+        try:
+            run = latest_run(http, url, hdrs)
+        except ConnectionError as e:
+            raise RuntimeError(f"reading check runs failed: {e}") from e
+        if run and run.get("status") == "completed":
             if run.get("conclusion") != "success":
                 raise RuntimeError(f"{name} concluded {run.get('conclusion')}")
             return run
-        if clock() >= deadline:
+        if clock() + interval > deadline:
             raise RuntimeError(f"{name} did not complete on {sha[:12]} within {int(timeout)}s")
         sleep(interval)
 
@@ -460,16 +553,21 @@ def wait_for_check(http: Http, repo: str, sha: str, name: str, token: str, timeo
 def markdown(label: str, result: dict) -> str:
     f = result["findings"]
     n = {s: sum(x["severity"] == s for x in f) for s in ("critical", "warn")}
-    lines = [f"### SEO standard: {label}", "",
-             f"{n['critical']} critical, {n['warn']} warnings ({result['facts'].get('mode')})", ""]
+    lines = [f"### SEO standard: {label}", ""]
+    if result.get("unauditable"):
+        lines += [f"**Not audited:** {result['unauditable']}", ""]
+    lines += [f"{n['critical']} critical, {n['warn']} warnings ({result['facts'].get('mode')})", ""]
     lines += [f"- **{x['severity']}** `{x['code']}` {x['detail']}" for x in f if x["severity"] != "info"]
     return "\n".join(lines) + "\n"
 
 
 def annotate(result: dict) -> str:
     level = {"critical": "error", "warn": "warning"}
-    return "".join(f"::{level[x['severity']]} title=SEO {x['code']}::{x['detail']}\n"
-                   for x in result["findings"] if x["severity"] in level)
+    out = "".join(f"::{level[x['severity']]} title=SEO {x['code']}::{x['detail']}\n"
+                  for x in result["findings"] if x["severity"] in level)
+    if result.get("unauditable"):
+        out += f"::error title=SEO not audited::{result['unauditable']}\n"
+    return out
 
 
 def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ) -> int:
@@ -537,6 +635,9 @@ def main(argv: list[str] | None = None, http: Http | None = None, env=os.environ
         sys.stdout.write(report)
     if args.github:
         sys.stdout.write(annotate(result))
+    if result.get("unauditable"):
+        print(f"audit: {result['unauditable']}", file=sys.stderr)
+        return 2
     return 1 if any(x["severity"] == "critical" for x in result["findings"]) else 0
 
 
