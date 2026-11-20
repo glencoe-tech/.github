@@ -176,7 +176,7 @@ class Page(html.parser.HTMLParser):
             self._hidden += 1
         elif tag == "h1" and not self._hidden:
             self.h1 += 1
-        if tag in BLOCK_ELEMENTS:
+        if tag in BLOCK_ELEMENTS and not self._hidden:  # hidden subtrees add no word breaks either
             self._chunks.append(" ")
         if tag == "title":
             self._in_title = True
@@ -201,7 +201,7 @@ class Page(html.parser.HTMLParser):
             self._in_head = False
         if tag in HIDDEN_ELEMENTS and self._hidden:
             self._hidden -= 1
-        if tag in BLOCK_ELEMENTS:
+        if tag in BLOCK_ELEMENTS and not self._hidden:
             self._chunks.append(" ")
         if tag == "title":
             self._in_title = False
