@@ -54,14 +54,18 @@ their own.
 - the homepage is not 200
 - `noindex` in production. Meta robots, or an `X-Robots-Tag` that applies to Googlebot or
   Bingbot; a tag scoped to another crawler, e.g. `googlebot-news:`, does not count
-- `robots.txt` disallows the homepage for Googlebot or Bingbot (RFC 9309 matching: wildcards,
-  `$`, longest rule wins, Allow wins a tie), or answers 5xx/401/403 (Google then crawls nothing)
+- `robots.txt` disallows the homepage for Googlebot or Bingbot, or answers 429 or 5xx, which
+  Google treats as disallow-all.
+  - Matching follows RFC 9309: a crawler's own group, even an empty one, replaces `*`;
+    wildcards and `$` are honoured; the longest rule wins and Allow wins a tie; queries are kept;
+    percent-encoding is normalised.
+  - Redirects are followed for up to 5 hops.
 - `robots.txt` or a sitemap whose body is an HTML page (the SPA fallback)
 - a sitemap that is missing, invalid XML, not a sitemap, or lists URLs on another host
 - a sampled sitemap URL that is:
   - not a 200 (redirects count)
   - `noindex`
-  - disallowed by robots.txt
+  - disallowed by robots.txt for Googlebot or Bingbot
   - declaring another page as its canonical
 - the homepage's `rel=canonical` pointing anywhere but the production URL
 - `http://` or the other `www` form not ending at the canonical URL
@@ -71,7 +75,8 @@ their own.
 - missing title, description, Open Graph tags, rel=canonical or meta viewport
 - invalid JSON-LD
 - a temporary (non-301/308) host redirect
-- no `robots.txt` at all (404): crawlers treat it as allow-all, but it should name the sitemap
+- `robots.txt` answering another 4xx (404, 410, 401, 403): crawlers treat that as allow-all,
+  but it should exist and name the sitemap
 - valid `robots.txt` or sitemap XML served with an HTML content type
 - robots naming no sitemap, or not naming the declared one
 - an AI search crawler blocked (`OAI-SearchBot`, `PerplexityBot`, `Claude-SearchBot`, …)

@@ -138,7 +138,7 @@ class Page(html.parser.HTMLParser):
 
     def __init__(self, text: str):
         super().__init__(convert_charrefs=True)
-        self.title, self.canonical, self.robots, self.viewport = "", "", "", False
+        self.title, self.canonical, self.robots, self.viewport, self.base = "", "", "", False, ""
         self.meta: dict[str, str] = {}
         self.jsonld: list[str] = []
         self._in_title = self._in_ld = False
@@ -148,6 +148,8 @@ class Page(html.parser.HTMLParser):
         a = {k.lower(): (v or "") for k, v in attrs}
         if tag == "title":
             self._in_title = True
+        elif tag == "base" and a.get("href") and not self.base:
+            self.base = a["href"]
         elif tag == "link" and "canonical" in a.get("rel", "").lower().split():
             self.canonical = self.canonical or a.get("href", "")
         elif tag == "meta":
@@ -176,8 +178,8 @@ class Page(html.parser.HTMLParser):
 
 
 def noindex(directives: str) -> bool:
-    """`noindex` or `none` among comma-separated meta robots directives."""
-    return any(d.strip() in ("noindex", "none") for d in directives.lower().split(","))
+    """`noindex` or `none` among meta robots directives (comma- or space-separated)."""
+    return any(d in ("noindex", "none") for d in re.split(r"[,\s]+", directives.lower()))
 
 
 def header_noindex(value: str, agents=SEARCH_CRAWLERS) -> bool:
@@ -229,18 +231,29 @@ def robots_groups(text: str) -> list[tuple[set[str], list[tuple[bool, str]]]]:
     return groups
 
 
+def _decode(target: str) -> str:
+    """A path for comparison: percent-escapes of unreserved characters decoded (RFC 9309 §2.2.2),
+    `%2F` and other reserved escapes kept, hex digits upper-cased."""
+    def one(m):
+        ch = chr(int(m.group(1), 16))
+        return ch if (ch.isalnum() and ch.isascii()) or ch in "-._~" else "%" + m.group(1).upper()
+    return re.sub(r"%([0-9A-Fa-f]{2})", one, target)
+
+
 def _pattern(path: str) -> re.Pattern:
     anchored = path.endswith("$")
-    body = re.escape(path[:-1] if anchored else path).replace(r"\*", ".*")
+    body = re.escape(_decode(path[:-1] if anchored else path)).replace(r"\*", ".*")
     return re.compile(body + ("$" if anchored else ""))
 
 
-def allowed(text: str, agent: str, path: str = "/") -> bool:
-    """Google's robots.txt evaluation (RFC 9309): the agent's own groups (else `*`), the longest
-    matching rule wins, and Allow wins a tie. No matching rule: allowed."""
+def allowed(text: str, agent: str, target: str = "/") -> bool:
+    """Google's robots.txt evaluation (RFC 9309): the agent's own groups if any exist, even with no
+    rules, else `*`; the longest matching rule wins and Allow wins a tie; no match is allowed.
+    `target` is the path with its query."""
     groups = robots_groups(text)
-    rules = [r for a, rs in groups if agent in a for r in rs] or \
-            [r for a, rs in groups if "*" in a for r in rs]
+    own = [rs for a, rs in groups if agent in a]
+    rules = [r for rs in (own or [rs for a, rs in groups if "*" in a]) for r in rs]
+    path = _decode(target)
     best: tuple[int, bool] | None = None
     for allow, pat in rules:
         if _pattern(pat).match(path):
@@ -259,6 +272,11 @@ def looks_html(body: bytes) -> bool:
     """The body is an HTML document (a framework's fallback page), judged by content, not MIME."""
     head = body.lstrip(b"\xef\xbb\xbf \t\r\n")[:1024].lower()
     return head.startswith((b"<!doctype html", b"<html")) or (b"<html" in head and b"<head" in head)
+
+
+def canonical_of(page: Page, url: str) -> str:
+    """The page's canonical as an absolute URL, resolved against its <base href> if it has one."""
+    return urllib.parse.urljoin(urllib.parse.urljoin(url, page.base), page.canonical)
 
 
 def finding(severity: str, code: str, detail: str) -> dict:
@@ -288,6 +306,17 @@ class Live:
     def get(self, production_url: str) -> Response:
         return self.http.get(self.url(production_url), self.headers)
 
+    def get_following(self, production_url: str, hops: int = 5) -> Response:
+        """GET following up to `hops` redirects (as crawlers do for robots.txt)."""
+        url = self.url(production_url)
+        r = self.http.get(url, self.headers)
+        for _ in range(hops):
+            if r.status not in REDIRECTS or not r.header("location"):
+                break
+            url = urllib.parse.urljoin(url, r.header("location"))
+            r = self.http.get(url, self.headers)
+        return r
+
 
 class Build:
     """Files read from a static build directory, served as a static host would."""
@@ -309,6 +338,8 @@ class Build:
                          else "text/plain")
                 return Response(200, {"content-type": ctype}, body, f)
         return Response(404, {}, b"", production_url)
+
+    get_following = get
 
 
 # --- the audit -----------------------------------------------------------------------------------
@@ -376,7 +407,7 @@ def _homepage(r: Response, canonical: str, mode: str, out: list[dict], facts: di
         out.append(finding("warn", "no-meta-description", "the homepage has no meta description"))
     if not page.canonical:
         out.append(finding("warn", "no-canonical", "the homepage declares no rel=canonical"))
-    elif norm(urllib.parse.urljoin(canonical, page.canonical)) != norm(canonical):
+    elif norm(canonical_of(page, canonical)) != norm(canonical):
         out.append(finding("critical", "canonical-mismatch",
                            f"rel=canonical is {page.canonical}, expected {canonical}"))
     missing = [k for k in ("og:title", "og:description", "og:image") if not page.meta.get(k)]
@@ -396,13 +427,16 @@ def _homepage(r: Response, canonical: str, mode: str, out: list[dict], facts: di
 
 def _robots(r: Response, mode: str, out: list[dict], facts: dict) -> str:
     """The robots.txt text crawlers obey ('' when none: everything is allowed)."""
-    if r.status in (404, 410):
-        out.append(finding("warn", "robots-missing", f"robots.txt answered {r.status}: crawlers treat that as "
-                           "allow-all, but it should name the sitemap"))
+    if r.status == 429 or r.status >= 500 or r.status in REDIRECTS:
+        # 429 and 5xx: Google crawls nothing until it can read robots.txt. A redirect still
+        # unresolved after 5 hops counts as unreadable too.
+        out.append(finding("critical", "robots-unreadable", f"robots.txt answered {r.status}: crawlers "
+                           "treat that as disallow-all"))
         return ""
     if r.status != 200:
-        # Google treats an unreachable robots.txt (5xx) as disallow-all until it can read one.
-        out.append(finding("critical", "robots-unreadable", f"robots.txt answered {r.status}"))
+        # Any other 4xx (404, 410, 401, 403): crawlers treat it as allow-all.
+        out.append(finding("warn", "robots-missing", f"robots.txt answered {r.status}: crawlers treat that as "
+                           "allow-all, but it should name the sitemap"))
         return ""
     if looks_html(r.body):
         out.append(finding("critical", "robots-is-html", "robots.txt returns an HTML page"))
@@ -427,9 +461,12 @@ def _robots(r: Response, mode: str, out: list[dict], facts: dict) -> str:
 
 def _sampled(src, mode: str, robots: str, urls: list[str], out: list[dict]) -> None:
     for u in urls[:SAMPLE_URLS]:
-        path = urllib.parse.urlsplit(u).path or "/"
-        if robots and mode != "preview" and not allowed(robots, "googlebot", path):
-            out.append(finding("critical", "sitemap-url-disallowed", f"{u} is listed but robots.txt disallows it"))
+        p = urllib.parse.urlsplit(u)
+        target = (p.path or "/") + (f"?{p.query}" if p.query else "")
+        blocked_for = [a for a in SEARCH_CRAWLERS if robots and not allowed(robots, a, target)]
+        if blocked_for and mode != "preview":
+            out.append(finding("critical", "sitemap-url-disallowed",
+                               f"{u} is listed but robots.txt disallows it for {', '.join(blocked_for)}"))
         s = src.get(u)
         if s.status == 404 and mode == "artifact":
             out.append(finding("info", "sitemap-url-not-static", f"{u} is not a file in the build (rendered at runtime?)"))
@@ -440,7 +477,7 @@ def _sampled(src, mode: str, robots: str, urls: list[str], out: list[dict]) -> N
         page = Page(s.text())
         if mode != "preview" and (header_noindex(s.header("x-robots-tag")) or noindex(page.robots)):
             out.append(finding("critical", "sitemap-url-noindex", f"{u} is noindex but listed in the sitemap"))
-        if page.canonical and norm(urllib.parse.urljoin(u, page.canonical)) != norm(u):
+        if page.canonical and norm(canonical_of(page, u)) != norm(u):
             out.append(finding("critical", "sitemap-url-canonical-elsewhere",
                                f"{u} declares rel=canonical {page.canonical}: list only canonical URLs"))
 
@@ -467,7 +504,7 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
                                    "Googlebot is allowed with URL Inspection"))
             return {"findings": out, "facts": facts}
         _homepage(r, canonical, mode, out, facts)
-        robots = _robots(src.get(f"https://{host(canonical)}/robots.txt"), mode, out, facts)
+        robots = _robots(src.get_following(f"https://{host(canonical)}/robots.txt"), mode, out, facts)
         declared = facts.get("robots_sitemaps", [])
         for m in sitemaps:
             if declared and m not in declared:
@@ -524,7 +561,8 @@ def latest_run(http: Http, url: str, hdrs: dict) -> dict | None:
         runs += json.loads(r.body).get("check_runs", [])
         m = NEXT_LINK.search(r.header("link"))
         url = m.group(1) if m else ""
-    return max(runs, key=lambda c: (c.get("started_at") or "", c.get("id") or 0), default=None)
+    # Ids grow with creation, so the highest id is the newest run, queued or not.
+    return max(runs, key=lambda c: c.get("id") or 0, default=None)
 
 
 def wait_for_check(http: Http, repo: str, sha: str, name: str, token: str, timeout: float = 900,
@@ -535,6 +573,7 @@ def wait_for_check(http: Http, repo: str, sha: str, name: str, token: str, timeo
     hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     deadline = clock() + timeout
     while True:
+        http.timeout = max(1.0, min(http.timeout, deadline - clock()))
         try:
             run = latest_run(http, url, hdrs)
         except ConnectionError as e:

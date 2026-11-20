@@ -148,6 +148,11 @@ class Production(unittest.TestCase):
         t[("GET", "https://example.com/")] = R(200, HOME, x_robots_tag="unavailable_after: 2030-01-01, googlebot: none")
         self.assertIn("homepage-noindex-header", codes(run(t), "critical"))
 
+    def test_a_canonical_resolves_against_the_documents_base(self):
+        t = live()
+        t[("GET", "https://example.com/a")] = R(200, page("a", b'<base href="/">'))
+        self.assertEqual(loud(run(t)), [])
+
     def test_a_relative_canonical_resolves_against_the_production_url(self):
         t = live()
         t[("GET", "https://example.com/")] = R(200, page("/"))
@@ -159,10 +164,23 @@ class Production(unittest.TestCase):
         result = run(t)
         self.assertIn("robots-missing", codes(result, "warn"), "a missing robots.txt allows crawling")
         self.assertEqual(codes(result, "critical"), set())
-        t[("GET", "https://example.com/robots.txt")] = R(403)
-        self.assertIn("robots-unreadable", codes(run(t), "critical"))
+        for status in (401, 403):
+            t[("GET", "https://example.com/robots.txt")] = R(status)
+            self.assertEqual((codes(run(t), "critical"), "robots-missing" in codes(run(t), "warn")), (set(), True),
+                             f"{status}: crawlers treat a 4xx robots.txt as allow-all")
+        for status in (429, 503):
+            t[("GET", "https://example.com/robots.txt")] = R(status)
+            self.assertIn("robots-unreadable", codes(run(t), "critical"))
         t[("GET", "https://example.com/robots.txt")] = R(200, b"<!doctype html><html>", content_type="text/html")
         self.assertIn("robots-is-html", codes(run(t), "critical"))
+
+    def test_robots_redirects_are_followed(self):
+        t = live()
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="https://example.com/r/robots.txt")
+        t[("GET", "https://example.com/r/robots.txt")] = R(200, ROBOTS)
+        self.assertEqual(loud(run(t)), [])
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="/robots.txt")
+        self.assertIn("robots-unreadable", codes(run(t), "critical"), "a redirect loop never resolves")
 
     def test_robots_judged_by_content_not_mime(self):
         t = live()
@@ -181,6 +199,12 @@ class Production(unittest.TestCase):
         t = live()
         t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nDisallow: /a\n" + ROBOTS)
         self.assertIn("sitemap-url-disallowed", codes(run(t), "critical"))
+        t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: bingbot\nDisallow: /a\n\n" + ROBOTS)
+        self.assertEqual([f["detail"] for f in run(t)["findings"] if f["code"] == "sitemap-url-disallowed"],
+                         ["https://example.com/a is listed but robots.txt disallows it for bingbot"])
+        t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nDisallow: /\n\nUser-agent: googlebot\n"
+                                                         b"Disallow:\n\nUser-agent: bingbot\nDisallow:\n")
+        self.assertNotIn("robots-blocks-search", codes(run(t)), "a crawler's own empty group overrides *")
         t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nSitemap: https://example.com/o.xml\n")
         self.assertIn("sitemap-not-in-robots", codes(run(t), "warn"))
         t[("GET", "https://example.com/robots.txt")] = R(200, b"User-agent: *\nAllow: /\n")
@@ -349,9 +373,15 @@ class Parsing(unittest.TestCase):
         self.assertFalse(seo.allowed("User-agent: Googlebot # g\nUser-agent: Bingbot\nDisallow: /\n", "bingbot"))
         self.assertFalse(seo.allowed("User-agent: *\nDisallow: /*.pdf$\n", "googlebot", "/a.pdf"))
         self.assertTrue(seo.allowed("User-agent: *\nDisallow: /*.pdf$\n", "googlebot", "/a.pdf.html"))
+        self.assertTrue(seo.allowed("User-agent: *\nDisallow: /a\nAllow: /a?ok=1\n", "googlebot", "/a?ok=1"),
+                        "the query is part of what is matched")
+        self.assertFalse(seo.allowed("User-agent: *\nDisallow: /a\n", "googlebot", "/%61"), "%61 is a")
+        self.assertFalse(seo.allowed("User-agent: *\nDisallow: /%7Ex\n", "googlebot", "/~x"))
+        self.assertTrue(seo.allowed("User-agent: *\nDisallow: /a/b\n", "googlebot", "/a%2Fb"), "%2F stays reserved")
         self.assertEqual(seo.robots_sitemaps("sitemap: https://x/a.xml\n"), ["https://x/a.xml"])
 
     def test_page_and_helpers(self):
+        self.assertTrue(seo.noindex("noindex nofollow"))
         p = seo.Page('<meta name="googlebot" content="NONE"><link rel="alternate" href="x"><meta content="x">')
         self.assertTrue(seo.noindex(p.robots))
         self.assertEqual(p.canonical, "")
@@ -415,13 +445,24 @@ class PreviewResolution(unittest.TestCase):
         h, _ = self.api({"check_runs": [old_ok, running]},
                         {"check_runs": [old_ok, dict(running, status="completed", conclusion="success")]})
         self.assertEqual(self.wait(h)["id"], 3, "a newer running deploy is waited for, not the older success")
+        queued = {"id": 4, "started_at": None, "status": "queued"}
+        h, _ = self.api({"check_runs": [old_ok, queued]},
+                        {"check_runs": [old_ok, dict(queued, status="completed", conclusion="failure")]})
+        with self.assertRaisesRegex(RuntimeError, "concluded failure"):
+            self.wait(h)
+
+    def test_requests_never_outlast_the_deadline(self):
+        h, _ = self.api({"check_runs": [self.WORKERS]})
+        h.timeout = 20
+        seo.wait_for_check(h, "o/r", "abc", "Workers Builds: peeps-web", "t", 5, 1, iter([0, 1, 2]).__next__, lambda s: None)
+        self.assertEqual(h.timeout, 4)
 
     def test_every_page_of_the_listing_is_read(self):
         page2 = self.URL + "&page=2"
         h, _ = http({("GET", self.URL): R(200, json.dumps({"check_runs": [dict(self.WORKERS, started_at="1")]}).encode(),
                                           link=f'<{page2}>; rel="next"'),
                      ("GET", page2): R(200, json.dumps({"check_runs": [dict(self.PAGES, started_at="2")]}).encode())})
-        self.assertEqual(self.wait(h)["id"], 1)
+        self.assertEqual(self.wait(h)["id"], 2, "the highest id across every page")
 
     def test_failure_timeout_and_api_errors(self):
         h, _ = self.api({"check_runs": [{"status": "completed", "conclusion": "failure"}]})
