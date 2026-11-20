@@ -21,13 +21,17 @@ CANON = "https://example.com/"
 SITEMAP = "https://example.com/sitemap.xml"
 
 
+BODY = b" ".join([b"word"] * 60)
+
+
 def page(canonical="https://example.com/", extra=b""):
     return (b'<!doctype html><html><head><title>Example</title>'
             b'<link rel="canonical" href="' + canonical.encode() + b'">'
             b'<meta name="description" content="d"><meta property="og:title" content="t">'
             b'<meta property="og:description" content="d"><meta property="og:image" content="i">'
             b'<meta name="viewport" content="width=device-width">' + extra +
-            b'<script type="application/ld+json">{"@type": "Organization"}</script></head></html>')
+            b'<script type="application/ld+json">{"@type": "Organization"}</script></head>'
+            b'<body><h1>Example</h1><p>' + BODY + b'</p></body></html>')
 
 
 HOME = page()
@@ -48,6 +52,7 @@ def live(origin="https://example.com"):
         ("GET", f"{origin}/robots.txt"): R(200, ROBOTS, content_type="text/plain"),
         ("GET", f"{origin}/sitemap.xml"): R(200, URLSET, content_type="application/xml"),
         ("GET", f"{origin}/a"): R(200, page("https://example.com/a"), content_type="text/html"),
+        ("GET", f"{origin}{seo.SOFT_404_PATH}"): R(404, b"not found", content_type="text/html"),
     }
 
 
@@ -375,6 +380,97 @@ class Parsing(unittest.TestCase):
         self.assertEqual(seo.Http(send=fake, sleep=lambda s: None, attempts=3).get("https://x/").status, 429)
         with self.assertRaises(ConnectionError):
             seo.Http(send=Fake({}), sleep=lambda s: None).get("https://x/")
+
+
+class DiscoverabilityGaps(unittest.TestCase):
+    """The rules ported from the reviewed discoverability check (glencoe-tech/.github#28, closed as
+    superseded): served content, soft 404s, #fragment sitemap URLs, robots.txt redirects,
+    percent-encoded robots paths, and query strings in sampled robots paths."""
+
+    SHELL = (b'<!doctype html><html><head><title>Shell</title><link rel="canonical" href="https://example.com/">'
+             b'<meta name="description" content="d"></head><body><div id="root"></div>'
+             b'<noscript>You need to enable JavaScript to run this app and see everything here.</noscript>'
+             b'<template><h1>Hidden</h1><p>' + BODY + b'</p></template><script>boot()</script></body></html>')
+
+    def test_a_javascript_shell_is_a_warning_in_every_mode(self):
+        t = live()
+        t[("GET", "https://example.com/")] = R(200, self.SHELL, content_type="text/html")
+        result = run(t)
+        shells = [f for f in result["findings"] if f["code"] == "served-content-empty"]
+        self.assertEqual([f["severity"] for f in shells], ["warn"])  # homepage once, though sampled too
+        self.assertEqual(result["facts"]["served_words"], 0)
+        self.assertEqual(codes(run(t), "critical"), set())
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        with open(os.path.join(d, "index.html"), "wb") as fh:
+            fh.write(self.SHELL)
+        self.assertIn("served-content-empty", codes(seo.audit(CANON, [], mode="artifact", dist=d)))
+
+    def test_short_pages_under_a_heading_and_unclosed_heads_pass(self):
+        form = (b'<html><head><title>Quote</title><link rel="canonical" href="https://example.com/a">'
+                b'<body><h1>Get a quote</h1><p>Three short steps.</p></body></html>')
+        self.assertEqual((seo.Page(form.decode()).h1, seo.Page(form.decode()).words), (1, 6))
+        unclosed = "<html><head><title>t</title><meta name=x content=y>" + " ".join(["w"] * 60)
+        self.assertEqual(seo.Page(unclosed).words, 60)
+        self.assertEqual(seo.Page("<head></head><body></noscript>a b</body>").words, 2)
+        t = live()
+        t[("GET", "https://example.com/a")] = R(200, form.replace(b"Three short steps.", b"Short."), content_type="text/html")
+        self.assertNotIn("served-content-empty", codes(run(t)))
+
+    def test_soft_404(self):
+        t = live()
+        t[("GET", f"https://example.com{seo.SOFT_404_PATH}")] = R(200, HOME, content_type="text/html")
+        self.assertEqual({f["severity"] for f in run(t)["findings"] if f["code"] == "soft-404"}, {"warn"})
+        del t[("GET", f"https://example.com{seo.SOFT_404_PATH}")]  # the probe fails: no verdict, no crash
+        result = run(t)
+        self.assertNotIn("soft-404", codes(result))
+        self.assertNotIn("unauditable", result)
+
+    def test_fragment_sitemap_urls(self):
+        t = live()
+        t[("GET", SITEMAP)] = R(200, URLSET.replace(b"https://example.com/a<", b"https://example.com/#a<"), content_type="application/xml")
+        result = run(t)
+        self.assertIn("sitemap-url-fragment", codes(result, "warn"))
+        self.assertEqual(codes(result, "critical"), set())
+
+    def test_robots_redirects(self):
+        t = live()
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="/rules/start")
+        t[("GET", "https://example.com/rules/start")] = R(302, location="robots.txt")
+        t[("GET", "https://example.com/rules/robots.txt")] = R(200, b"User-agent: *\nDisallow: /\n", content_type="text/plain")
+        self.assertIn("robots-blocks-search", codes(run(t), "critical"))  # each hop resolves against the last
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="/rules,production.txt")
+        t[("GET", "https://example.com/rules,production.txt")] = R(200, b"User-agent: *\nDisallow: /\n", content_type="text/plain")
+        self.assertIn("robots-blocks-search", codes(run(t), "critical"))  # a comma is part of the URL
+        for n in range(seo.ROBOTS_REDIRECTS):  # exactly five redirects still reach the rules
+            t[("GET", f"https://example.com/hop{n}")] = R(301, location=f"/hop{n + 1}")
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="/hop1")
+        t[("GET", f"https://example.com/hop{seo.ROBOTS_REDIRECTS}")] = R(200, b"User-agent: *\nDisallow: /\n", content_type="text/plain")
+        self.assertIn("robots-blocks-search", codes(run(t), "critical"))
+        t[("GET", "https://example.com/robots.txt")] = R(302, location="/robots.txt")
+        loop = run(t)
+        self.assertTrue({"robots-redirect-loop", "robots-missing"} <= codes(loop, "warn"))
+        self.assertNotIn("robots-blocks-search", codes(loop))
+        for target in ("https://[invalid/robots.txt", "https://example.com:bad/r.txt", "mailto:x@example.com"):
+            t[("GET", "https://example.com/robots.txt")] = R(302, location=target)
+            self.assertIn("robots-redirect-invalid", codes(run(t), "warn"), target)
+        t[("GET", "https://example.com/robots.txt")] = R(301, location="https://gone.example.net/robots.txt")
+        self.assertIn("robots-unreadable", codes(run(t), "critical"))  # unreachable: treat as disallow-all
+
+    def test_percent_encoded_paths_and_queries(self):
+        rules = "User-agent: *\nDisallow: /private\nDisallow: /caf\u00e9\nDisallow: /a%2fb\nDisallow: /search?\n"
+        self.assertFalse(seo.allowed(rules, "googlebot", "/%70rivate"))
+        self.assertFalse(seo.allowed(rules, "googlebot", "/caf%c3%a9/menu"))
+        self.assertFalse(seo.allowed(rules, "googlebot", "/a%2Fb"))  # a reserved escape keeps its meaning
+        self.assertTrue(seo.allowed(rules, "googlebot", "/a/b"))
+        self.assertEqual(seo.octets("/%7euser/%zz"), "/~user/%zz")
+        # RFC 9309 2.2.2: the most specific rule has the most octets, so /* (2) beats / (1).
+        self.assertFalse(seo.allowed("User-agent: *\nAllow: /\nDisallow: /*\n", "googlebot", "/x"))
+        t = live()
+        t[("GET", "https://example.com/robots.txt")] = R(200, ROBOTS + b"Disallow: /search?\n", content_type="text/plain")
+        t[("GET", SITEMAP)] = R(200, URLSET.replace(b"https://example.com/a<", b"https://example.com/search?q=1<"), content_type="application/xml")
+        t[("GET", "https://example.com/search?q=1")] = R(200, page("https://example.com/search?q=1"), content_type="text/html")
+        self.assertIn("sitemap-url-disallowed", codes(run(t), "critical"))
 
 
 class PreviewResolution(unittest.TestCase):

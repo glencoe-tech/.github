@@ -55,13 +55,16 @@ their own.
 - `noindex` in production. Meta robots, or an `X-Robots-Tag` that applies to Googlebot or
   Bingbot; a tag scoped to another crawler, e.g. `googlebot-news:`, does not count
 - `robots.txt` disallows the homepage for Googlebot or Bingbot (RFC 9309 matching: wildcards,
-  `$`, longest rule wins, Allow wins a tie), or answers 5xx/401/403 (Google then crawls nothing)
+  `$`, longest rule in octets wins, Allow wins a tie, paths compared after percent-encoding
+  normalisation, so `/%70rivate` is `/private`), or answers 5xx/401/403/429 or redirects to an
+  unreachable host (Google then crawls nothing). Up to five redirects are followed, each resolved
+  against the URL that returned it
 - `robots.txt` or a sitemap whose body is an HTML page (the SPA fallback)
 - a sitemap that is missing, invalid XML, not a sitemap, or lists URLs on another host
 - a sampled sitemap URL that is:
   - not a 200 (redirects count)
   - `noindex`
-  - disallowed by robots.txt
+  - disallowed by robots.txt (path and query)
   - declaring another page as its canonical
 - the homepage's `rel=canonical` pointing anywhere but the production URL
 - `http://` or the other `www` form not ending at the canonical URL
@@ -77,6 +80,16 @@ their own.
 - an AI search crawler blocked (`OAI-SearchBot`, `PerplexityBot`, `Claude-SearchBot`, …)
 - an empty sitemap
 - an edge bot challenge
+- `served-content-empty`: the homepage or a sampled page serves fewer than 50 words and no `<h1>`
+  without JavaScript (`<script>`, `<style>`, `<noscript>`, `<template>` and `<svg>` do not count).
+  Google renders JavaScript; most AI-search crawlers do not, so a client-rendered page is empty to
+  them. Prerender it. A short page under a server-rendered `<h1>`, such as a form, passes. This is
+  a warning while the eight sites it flags today are remediated
+- `soft-404` (production): a URL that does not exist answers 200
+- `sitemap-url-fragment`: sitemap URLs with a `#fragment` (crawlers drop it, so each duplicates the
+  page without it); they are not sampled
+- `robots-redirect-loop`, `robots-redirect-invalid`: `robots.txt` redirects more than five times or
+  to an unusable URL; crawlers then treat it as missing
 
 **Info:** no structured data; which training crawlers (`GPTBot`, `Google-Extended`, `CCBot`, …)
 are blocked. Blocking those is a legitimate choice for each client.

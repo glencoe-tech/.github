@@ -47,6 +47,16 @@ AI_SEARCH_CRAWLERS = ("oai-searchbot", "chatgpt-user", "perplexitybot", "perplex
 TRAINING_CRAWLERS = ("gptbot", "google-extended", "ccbot", "claudebot", "applebot-extended", "bytespider")
 # Robots directives that themselves contain a colon, so `name: value` is not a crawler scope.
 COLON_DIRECTIVES = {"unavailable_after", "max-snippet", "max-image-preview", "max-video-preview"}
+# Served content: what a crawler that does not run JavaScript reads. Most AI-search crawlers do
+# not run it, so a client-rendered page (a shell with a handful of words and no <h1>) is empty to
+# them even when Google renders it. 50 words separates a shell from a real page without judging
+# length; a short page under a server-rendered <h1> (a form) passes.
+SERVED_WORDS = 50
+HIDDEN_ELEMENTS = {"script", "style", "noscript", "template", "svg"}
+HEAD_ELEMENTS = {"head", "title", "meta", "link", "script", "style", "base", "noscript", "template"}
+SOFT_404_PATH = "/glencoe-seo-standard-missing-page-probe"
+ROBOTS_REDIRECTS = 5  # RFC 9309 2.3.1.2: follow at least five consecutive redirects
+UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
 
 class Unauditable(Exception):
@@ -141,11 +151,21 @@ class Page(html.parser.HTMLParser):
         self.title, self.canonical, self.robots, self.viewport = "", "", "", False
         self.meta: dict[str, str] = {}
         self.jsonld: list[str] = []
-        self._in_title = self._in_ld = False
+        self.words = self.h1 = 0
+        self._in_title = self._in_ld = self._in_head = False
+        self._hidden = 0
         self.feed(text)
 
     def handle_starttag(self, tag, attrs):
         a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "head":
+            self._in_head = True
+        elif tag == "body" or tag not in HEAD_ELEMENTS:
+            self._in_head = False  # the head ends where browsers end it, even without </head>
+        if tag in HIDDEN_ELEMENTS:
+            self._hidden += 1
+        elif tag == "h1" and not self._hidden:
+            self.h1 += 1
         if tag == "title":
             self._in_title = True
         elif tag == "link" and "canonical" in a.get("rel", "").lower().split():
@@ -163,6 +183,10 @@ class Page(html.parser.HTMLParser):
             self.jsonld.append("")
 
     def handle_endtag(self, tag):
+        if tag == "head":
+            self._in_head = False
+        if tag in HIDDEN_ELEMENTS and self._hidden:
+            self._hidden -= 1
         if tag == "title":
             self._in_title = False
         elif tag == "script":
@@ -173,6 +197,9 @@ class Page(html.parser.HTMLParser):
             self.title += data
         elif self._in_ld:
             self.jsonld[-1] += data
+        elif not self._hidden and data.strip():
+            self._in_head = False  # text cannot sit in <head>
+            self.words += len(data.split())
 
 
 def noindex(directives: str) -> bool:
@@ -235,14 +262,33 @@ def _pattern(path: str) -> re.Pattern:
     return re.compile(body + ("$" if anchored else ""))
 
 
+def octets(path: str) -> str:
+    """RFC 9309 2.2.2: paths compare as octets. Non-ASCII is percent-encoded as UTF-8, an escaped
+    unreserved character is decoded, and any other escape keeps its meaning (upper-case hex)."""
+    out, i = [], 0
+    while i < len(path):
+        pair = path[i + 1:i + 3]
+        if path[i] == "%" and len(pair) == 2 and all(c in "0123456789abcdefABCDEF" for c in pair):
+            char = chr(int(pair, 16))
+            out.append(char if char in UNRESERVED else "%" + pair.upper())
+            i += 3
+            continue
+        out.append(path[i] if ord(path[i]) < 128 else "".join(f"%{b:02X}" for b in path[i].encode()))
+        i += 1
+    return "".join(out)
+
+
 def allowed(text: str, agent: str, path: str = "/") -> bool:
     """Google's robots.txt evaluation (RFC 9309): the agent's own groups (else `*`), the longest
-    matching rule wins, and Allow wins a tie. No matching rule: allowed."""
+    matching rule in octets wins, and Allow wins a tie. No matching rule: allowed. Rules and the
+    path are compared after percent-encoding normalisation, so /%70rivate is /private."""
     groups = robots_groups(text)
     rules = [r for a, rs in groups if agent in a for r in rs] or \
             [r for a, rs in groups if "*" in a for r in rs]
+    path = octets(path)
     best: tuple[int, bool] | None = None
-    for allow, pat in rules:
+    for allow, raw in rules:
+        pat = octets(raw)
         if _pattern(pat).match(path):
             key = (len(pat), allow)
             if best is None or key > best:
@@ -384,6 +430,8 @@ def _homepage(r: Response, canonical: str, mode: str, out: list[dict], facts: di
         out.append(finding("warn", "open-graph-incomplete", "missing " + ", ".join(missing)))
     if not page.viewport:
         out.append(finding("warn", "no-viewport", "no meta viewport: not mobile-friendly"))
+    facts["served_words"] = page.words
+    _served(page, canonical, out)
     facts["structured_data"] = len(page.jsonld)
     if not page.jsonld:
         out.append(finding("info", "no-structured-data", "no JSON-LD on the homepage"))
@@ -392,6 +440,53 @@ def _homepage(r: Response, canonical: str, mode: str, out: list[dict], facts: di
             json.loads(block)
         except ValueError:
             out.append(finding("warn", "structured-data-invalid", "a JSON-LD block is not valid JSON"))
+
+
+def _fetch_robots(src, url: str, out: list[dict]) -> Response:
+    """robots.txt as a crawler gets it: up to five redirects, each Location resolved against the URL
+    that returned it and kept whole. More than five, or an unusable Location, means no robots.txt
+    (answered as 404); an unreachable target means robots.txt is unreadable (answered as 503)."""
+    r, current = src.get(url), url
+    for _ in range(ROBOTS_REDIRECTS):
+        if r.status not in REDIRECTS or not r.header("location"):
+            return r
+        location = r.header("location").splitlines()[0].strip()
+        try:
+            current = urllib.parse.urljoin(current, location)
+            parts = urllib.parse.urlsplit(current)
+            if parts.scheme not in ("http", "https") or not parts.hostname:
+                raise ValueError(current)
+            parts.port  # noqa: B018 - raises ValueError on an invalid port
+        except ValueError:
+            out.append(finding("warn", "robots-redirect-invalid", f"robots.txt redirects to {location!r}, not a usable URL"))
+            return Response(404, {}, b"", url)
+        try:
+            r = src.get(current)
+        except ConnectionError:
+            return Response(503, {}, b"", current)
+    if r.status in REDIRECTS:
+        out.append(finding("warn", "robots-redirect-loop", f"robots.txt redirects more than {ROBOTS_REDIRECTS} times"))
+        return Response(404, {}, b"", url)
+    return r
+
+
+def _served(page: "Page", url: str, out: list[dict]) -> None:
+    """One warning per page: the homepage is checked once even when the sitemap samples it too."""
+    seen = {f.get("url") for f in out if f["code"] == "served-content-empty"}
+    if page.words < SERVED_WORDS and not page.h1 and norm(url) not in seen:
+        out.append({**finding("warn", "served-content-empty",
+                              f"{url} serves {page.words} words and no <h1> without JavaScript; most AI-search "
+                              "crawlers do not run it and see an empty page. Prerender it."), "url": norm(url)})
+
+
+def _soft_404(src, canonical: str, out: list[dict]) -> None:
+    probe = f"https://{host(canonical)}{SOFT_404_PATH}"
+    try:
+        r = src.get(probe)
+    except ConnectionError:
+        return
+    if r.status == 200:
+        out.append(finding("warn", "soft-404", f"{probe} does not exist but answers 200; missing pages must return 404"))
 
 
 def _robots(r: Response, mode: str, out: list[dict], facts: dict) -> str:
@@ -427,7 +522,8 @@ def _robots(r: Response, mode: str, out: list[dict], facts: dict) -> str:
 
 def _sampled(src, mode: str, robots: str, urls: list[str], out: list[dict]) -> None:
     for u in urls[:SAMPLE_URLS]:
-        path = urllib.parse.urlsplit(u).path or "/"
+        parts = urllib.parse.urlsplit(u)
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         if robots and mode != "preview" and not allowed(robots, "googlebot", path):
             out.append(finding("critical", "sitemap-url-disallowed", f"{u} is listed but robots.txt disallows it"))
         s = src.get(u)
@@ -443,6 +539,7 @@ def _sampled(src, mode: str, robots: str, urls: list[str], out: list[dict]) -> N
         if page.canonical and norm(urllib.parse.urljoin(u, page.canonical)) != norm(u):
             out.append(finding("critical", "sitemap-url-canonical-elsewhere",
                                f"{u} declares rel=canonical {page.canonical}: list only canonical URLs"))
+        _served(page, u, out)
 
 
 def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mode: str = "production",
@@ -467,7 +564,7 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
                                    "Googlebot is allowed with URL Inspection"))
             return {"findings": out, "facts": facts}
         _homepage(r, canonical, mode, out, facts)
-        robots = _robots(src.get(f"https://{host(canonical)}/robots.txt"), mode, out, facts)
+        robots = _robots(_fetch_robots(src, f"https://{host(canonical)}/robots.txt", out), mode, out, facts)
         declared = facts.get("robots_sitemaps", [])
         for m in sitemaps:
             if declared and m not in declared:
@@ -480,7 +577,14 @@ def audit(canonical: str, sitemaps: list[str], private_hosts: list[str] = (), mo
         if off:
             out.append(finding("critical", "sitemap-off-host",
                                f"{len(off)} URLs not on https://{host(canonical)}, e.g. {off[0]}"))
-        _sampled(src, mode, robots, [u for u in urls if u not in off], out)
+        fragments = [u for u in urls if "#" in u]
+        if fragments:
+            out.append(finding("warn", "sitemap-url-fragment",
+                               f"{len(fragments)} sitemap URLs carry a #fragment, e.g. {fragments[0]}; crawlers drop "
+                               "it, so each is a duplicate of the page without it"))
+        _sampled(src, mode, robots, [u for u in urls if u not in off and "#" not in u], out)
+        if mode == "production":
+            _soft_404(src, canonical, out)
         if mode == "production":
             for h in private_hosts:
                 try:
