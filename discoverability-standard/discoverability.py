@@ -286,14 +286,22 @@ def check_robots(report: Report, source, origin: str) -> tuple[list[str], dict[s
     """Return (sitemap URLs on the origin, robots groups). RFC 9309: a 4xx robots.txt allows
     everything; a 5xx or unreachable one means the whole site is disallowed."""
     url = origin + "/robots.txt"
-    resp = source.get(url)
-    hops = 0
-    while 300 <= resp.status < 400 and resp.header("location") and hops < 5:
+    resp, current, hops, broken = source.get(url), url, 0, False
+    while 300 <= resp.status < 400 and resp.headers.get("location") and hops < 5:
         hops += 1
-        resp = source.get(urllib.parse.urljoin(url, resp.header("location").split(",")[0].strip()))
+        try:  # each Location is resolved against the URL that returned it, and kept whole
+            current = urllib.parse.urljoin(current, resp.headers["location"][0].strip())
+            parts = urllib.parse.urlsplit(current)
+            if parts.scheme not in ("http", "https") or not parts.hostname:
+                raise ValueError(current)
+            parts.port  # noqa: B018 - raises ValueError on an invalid port
+        except ValueError:
+            broken = True
+            break
+        resp = source.get(current)
     fallback = [origin + "/sitemap.xml"]
-    if 300 <= resp.status < 400:
-        report.warn("robots-present", url, "robots.txt redirects more than five times or nowhere; crawlers treat it as missing")
+    if broken or 300 <= resp.status < 400:
+        report.warn("robots-present", url, "robots.txt redirects to an invalid URL, nowhere, or more than five times; crawlers treat it as missing")
         groups, sitemaps = {}, []
     elif resp.status in (0, 429) or resp.status >= 500:
         report.error("robots-present", url, f"robots.txt answered {resp.status or 'nothing'}: crawlers treat the whole site as disallowed")

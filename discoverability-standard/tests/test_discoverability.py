@@ -555,6 +555,22 @@ class DeltaReviewRegressionTests(unittest.TestCase):
         self.assertIn("robots-present", rules(busy))
         self.assertIn("search-crawler-allowed", rules(busy))
 
+    def test_redirect_chains_resolve_against_each_hop_and_keep_commas(self):
+        chained = self.live(**{
+            ORIGIN + "/robots.txt": d.Response(301, {"location": "/rules/start"}),
+            ORIGIN + "/rules/start": d.Response(302, {"location": "robots.txt"}),
+            ORIGIN + "/rules/robots.txt": "User-agent: *\nDisallow: /\n",
+        })
+        self.assertIn("search-crawler-allowed", rules(chained))
+        comma = self.live(**{
+            ORIGIN + "/robots.txt": d.Response(301, {"location": "/rules,production.txt"}),
+            ORIGIN + "/rules,production.txt": "User-agent: *\nDisallow: /\n",
+        })
+        self.assertIn("search-crawler-allowed", rules(comma))
+        for target in ("https://[invalid/robots.txt", "https://example.com:bad/robots.txt", "mailto:x@example.com"):
+            broken = self.live(**{ORIGIN + "/robots.txt": d.Response(302, {"location": target})})
+            self.assertEqual((rules(broken), rules(broken, "warning")), ([], ["robots-present"]), target)
+
     def test_percent_encoding_is_normalised(self):
         groups, _ = d.parse_robots("User-agent: *\nDisallow: /private\nDisallow: /café\nDisallow: /a%2fb\n")
         self.assertFalse(d.path_allowed(groups, "Bingbot", "/%70rivate"))
