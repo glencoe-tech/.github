@@ -459,6 +459,7 @@ class DiscoverabilityGaps(unittest.TestCase):
         self.assertEqual(seo.Page(unclosed).words, 60)
         self.assertEqual(seo.Page("<head></head><body></noscript>a b</body>").words, 2)
         self.assertEqual(seo.Page("<p>wo<span>rd</span> two</p><p>three</p>").text, "word two three")
+        self.assertEqual(seo.Page("<p>wo<template><div>hidden</div></template>rd</p>").text, "word")  # no break from hidden blocks
         self.assertEqual(seo.Page("<head>\n  <title>t</title>\n</head><body>x</body>").words, 1)  # head whitespace is not text
         fallback = "<body><noscript><h1>Welcome</h1><p>Our site works without JavaScript.</p></noscript></body>"
         self.assertEqual((seo.Page(fallback).h1, seo.Page(fallback).words), (1, 6))  # noscript is served text
