@@ -848,7 +848,7 @@ def indexnow(canonical: str, sitemaps: list[str], key: str, ledger, http: "Http"
 def ledger_name(canonical: str, workflow: str) -> str:
     """The ledger artifact's name: one per site and per calling workflow file, so another workflow
     (or another site in the same workflow) can never hand this one its ledger."""
-    path = workflow.split("@", 1)[0]
+    path = workflow.rsplit("@refs/", 1)[0]  # only the ref suffix goes: a filename may itself contain "@"
     return f"{LEDGER_ARTIFACT}-{host(canonical)}-{hashlib.sha256(path.encode()).hexdigest()[:12]}"
 
 

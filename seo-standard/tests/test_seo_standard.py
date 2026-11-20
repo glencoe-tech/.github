@@ -742,6 +742,8 @@ class IndexNow(unittest.TestCase):
         name = seo.ledger_name(CANON, "o/r/.github/workflows/seo.yml@refs/heads/main")
         self.assertEqual(name, seo.ledger_name(CANON, "o/r/.github/workflows/seo.yml@refs/tags/v2"))  # the ref does not matter
         self.assertNotEqual(name, seo.ledger_name(CANON, "o/r/.github/workflows/other.yml@refs/heads/main"))
+        self.assertNotEqual(seo.ledger_name(CANON, "o/r/.github/workflows/seo@prod.yml@refs/heads/main"),
+                            seo.ledger_name(CANON, "o/r/.github/workflows/seo@nightly.yml@refs/heads/main"))
         self.assertNotEqual(name, seo.ledger_name("https://other.example/", "o/r/.github/workflows/seo.yml@refs/heads/main"))
         api = f"https://api.github.com/repos/o/r/actions/artifacts?name={name}&per_page=100"
         listing = json.dumps({"artifacts": [{**a, "name": name} if isinstance(a, dict) else a for a in [
