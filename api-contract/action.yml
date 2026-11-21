@@ -67,7 +67,7 @@ runs:
         update-environment: false
     - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
-        node-version: "22"
+        node-version: "26"
         # No cache: the toolchain installs from its own lockfile, and a cache keyed on the
         # caller's files is not something this action should restore.
         package-manager-cache: false
