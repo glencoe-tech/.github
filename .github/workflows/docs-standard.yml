@@ -18,7 +18,7 @@ concurrency:
 jobs:
   docs:
     name: documentation standard (warn)
-    # This repository is public: the avenra-ci-k8s runner group does not serve public repositories,
+    # This repository is public: the forge-ci-k8s runner group does not serve public repositories,
     # so its own jobs run on GitHub-hosted runners (ENGINEERING-QUALITY-STANDARD.md §2 standing exception).
     runs-on: ubuntu-latest
     timeout-minutes: 5

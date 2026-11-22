@@ -16,11 +16,11 @@ on:
     inputs:
       runs-on:
         description: >-
-          Avenra runner target for both gate jobs. Defaults to avenra-ci-k8s.
+          Avenra runner target for both gate jobs. Defaults to forge-ci-k8s.
           Accepts a scalar label or JSON array. Use an approved isolated lane for public callers.
         type: string
         required: false
-        default: avenra-ci-k8s
+        default: forge-ci-k8s
       npm-scope:
         description: >-
           npm scope installed from GitHub Packages (e.g. "@glencoe-tech"), read with the job's
