@@ -29,7 +29,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.14"
+          python-version: "3.15"
       - uses: glencoe-tech/.github/docs-standard@162e0b9d702790bcec44e748ed5af0eac5aee9c1 # glencoe-tech/.github#24 merge commit
         with:
           mode: warn
